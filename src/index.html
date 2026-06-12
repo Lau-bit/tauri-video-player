@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self';
+             style-src 'self' 'unsafe-inline';
+             script-src 'self';
+             media-src 'self' asset: http://asset.localhost blob:;
+             img-src 'self' data: asset: http://asset.localhost blob:;">
+  <title>Video Player</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Custom title bar — entire bar is drag region except the buttons -->
+  <div id="titlebar">
+    <div id="titlebar-drag"></div>
+    <div id="titlebar-controls">
+      <button id="btn-minimize" title="Minimize">&#x2212;</button>
+      <button id="btn-maximize" title="Maximize">&#x25A1;</button>
+      <button id="btn-close" title="Close">&#x2715;</button>
+    </div>
+  </div>
+
+  <!-- Main player area -->
+  <div id="player-container">
+
+    <!-- The video element — no native controls -->
+    <video id="video" preload="metadata"></video>
+
+    <!-- Drag-and-drop overlay -->
+    <div id="drop-overlay">
+      <span>Drop video to open</span>
+    </div>
+
+    <!-- Transcode overlay (shown while ffmpeg is running) -->
+    <div id="transcode-overlay">
+      <div id="transcode-box">
+        <p id="transcode-msg">Transcoding with ffmpeg&hellip;</p>
+        <div id="transcode-bar-wrap">
+          <div id="transcode-bar"></div>
+        </div>
+        <p id="transcode-pct">0%</p>
+        <button id="btn-cancel-transcode">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Empty state (shown when no video loaded) -->
+    <div id="empty-state">
+      <div id="empty-icon">&#x25B6;</div>
+      <p id="empty-text">Drop a video file or click Open</p>
+      <button id="btn-open-empty">Open File</button>
+    </div>
+
+  </div>
+
+  <!-- Controls bar — permanent strip below the video -->
+  <div id="controls">
+
+    <!-- Seek bar -->
+    <div id="seekbar-row">
+      <input type="range" id="seekbar" min="0" max="10000" value="0" step="1">
+    </div>
+
+    <!-- Control bar -->
+    <div id="control-bar">
+
+      <div class="ctrl-group ctrl-left">
+        <button id="btn-prev" title="Newer in folder (B)">&#x23EE;</button>
+        <button id="btn-play" title="Play / Pause (Space)">&#x25B6;</button>
+        <button id="btn-next" title="Older in folder (N)">&#x23ED;</button>
+        <span id="time-display">0:00 / 0:00</span>
+      </div>
+
+      <div class="ctrl-group ctrl-center">
+        <span id="filename-display"></span>
+      </div>
+
+      <div class="ctrl-group ctrl-right">
+        <div id="speed-group">
+          <button id="btn-speed-down" title="Slow down ([)">&#x2212;</button>
+          <input type="range" id="speed-bar" min="0.25" max="2" value="1" step="0.05" title="Playback speed">
+          <button id="btn-speed-reset" title="Reset speed (0)">1x</button>
+          <button id="btn-speed-up" title="Speed up (])">+</button>
+        </div>
+        <button id="btn-loop" class="toggle-btn" title="Loop (L)">Loop</button>
+        <button id="btn-auto-switch" class="toggle-btn" title="Auto-switch to next video when current ends (A)">Next</button>
+        <button id="btn-autoplay-switched" class="toggle-btn" title="Autoplay switched videos (Shift+A)">Play</button>
+        <div id="volume-group">
+          <button id="btn-mute" title="Mute (M)">&#x1F50A;</button>
+          <input type="range" id="volume-bar" min="0" max="100" value="100" step="1">
+        </div>
+        <button id="btn-editor" title="Open Video Editor (right-click to set path)">&#x270F;</button>
+        <button id="btn-open" title="Open file" aria-label="Open file">
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3.75 6.75h6.1l1.8 2.1h8.6v8.4a2 2 0 0 1-2 2H5.75a2 2 0 0 1-2-2V6.75Z"></path>
+            <path d="M3.75 9.25h16.5"></path>
+          </svg>
+        </button>
+        <button id="btn-fullscreen" title="Fullscreen (F)">&#x26F6;</button>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="api.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

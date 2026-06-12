@@ -1,0 +1,546 @@
+/* ==============================
+   Design Tokens
+============================== */
+:root {
+  --bg: #0a0a0a;
+  --accent: #0078d4;
+  --text: #e8e8e8;
+  --text-muted: #888;
+  --btn-hover: rgba(255, 255, 255, 0.08);
+  --btn-active-bg: rgba(255, 255, 255, 0.14);
+  --radius-sm: 4px;
+  --titlebar-height: 32px;
+  --transition-show: 100ms ease;
+  --transition-hide: 350ms ease;
+}
+
+/* ==============================
+   Reset & Base
+============================== */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  user-select: none;
+  -webkit-user-select: none;
+  display: flex;
+  flex-direction: column;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* ==============================
+   Title Bar
+============================== */
+#titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--titlebar-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  z-index: 200;
+  -webkit-app-region: drag;
+  background: rgba(10, 10, 10, 0.85);
+}
+
+#titlebar-drag {
+  flex: 1;
+  height: 100%;
+}
+
+#titlebar-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 6px;
+  -webkit-app-region: no-drag;
+}
+
+#titlebar-controls button {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  width: 28px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s, color 0.1s;
+}
+
+#titlebar-controls button:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+#btn-close:hover {
+  background: #c42b1c !important;
+  color: #fff !important;
+}
+
+body.no-ui #titlebar {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ==============================
+   Player Container
+============================== */
+#player-container {
+  position: relative;
+  flex: 1;
+  margin-top: var(--titlebar-height);
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ==============================
+   Video Element
+============================== */
+#video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  display: block;
+  cursor: none;
+}
+
+body.ui-visible #video {
+  cursor: default;
+}
+
+body.no-ui #video {
+  cursor: default;
+}
+
+/* ==============================
+   Drop Overlay
+============================== */
+#drop-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 120, 212, 0.12);
+  border: 2px dashed var(--accent);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 400;
+  color: var(--text-muted);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s;
+  z-index: 50;
+}
+
+body.drag-over #drop-overlay {
+  opacity: 1;
+}
+
+/* ==============================
+   Transcode Overlay
+============================== */
+#transcode-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+body.transcoding #transcode-overlay {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#transcode-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 36px;
+  background: #1c1c1c;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  min-width: 280px;
+}
+
+#transcode-msg {
+  font-size: 14px;
+  color: var(--text);
+}
+
+#transcode-bar-wrap {
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+#transcode-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.4s linear;
+}
+
+#transcode-pct {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+#btn-cancel-transcode {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 5px 16px;
+  border-radius: var(--radius-sm);
+  transition: background 0.1s, color 0.1s;
+}
+
+#btn-cancel-transcode:hover {
+  background: var(--btn-hover);
+  color: var(--text);
+}
+
+/* ==============================
+   Empty State
+============================== */
+#empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  z-index: 10;
+  opacity: 1;
+  transition: opacity 0.2s;
+  pointer-events: auto;
+}
+
+body.has-video #empty-state {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#empty-icon {
+  font-size: 52px;
+  opacity: 0.18;
+  line-height: 1;
+}
+
+#empty-text {
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+#btn-open-empty {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 13px;
+  padding: 7px 18px;
+  border-radius: var(--radius-sm);
+  transition: background 0.1s, color 0.1s;
+}
+
+#btn-open-empty:hover {
+  background: var(--btn-hover);
+}
+
+/* ==============================
+   Controls Bar (permanent strip below video)
+============================== */
+#controls {
+  flex-shrink: 0;
+  background: var(--bg);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 8px 12px 10px;
+}
+
+body.no-ui #controls {
+  visibility: hidden; /* bar stays, content hidden */
+}
+
+/* ==============================
+   Seek Bar
+============================== */
+#seekbar-row {
+  padding: 0 2px 6px;
+}
+
+#seekbar {
+  width: 100%;
+  height: 3px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--seek-fill, 0%),
+    rgba(255, 255, 255, 0.22) var(--seek-fill, 0%),
+    rgba(255, 255, 255, 0.22) 100%
+  );
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+  transition: height 0.12s ease;
+}
+
+#seekbar:hover {
+  height: 5px;
+}
+
+#seekbar::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+#seekbar:hover::-webkit-slider-thumb {
+  opacity: 1;
+}
+
+/* ==============================
+   Control Bar
+============================== */
+#control-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 36px;
+}
+
+.ctrl-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ctrl-left {
+  flex-shrink: 0;
+}
+
+.ctrl-center {
+  flex: 1;
+  justify-content: center;
+  overflow: hidden;
+  padding: 0 8px;
+}
+
+.ctrl-right {
+  flex-shrink: 0;
+}
+
+/* ==============================
+   Control Buttons
+============================== */
+#control-bar button {
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 5px 7px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  line-height: 1;
+  transition: background 0.1s, color 0.1s;
+  white-space: nowrap;
+  min-width: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#control-bar button:hover {
+  background: var(--btn-hover);
+}
+
+#control-bar button:active {
+  background: var(--btn-active-bg);
+}
+
+#control-bar button:disabled {
+  color: rgba(232, 232, 232, 0.28);
+  cursor: default;
+}
+
+#control-bar button:disabled:hover {
+  background: none;
+}
+
+.control-icon {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Toggle buttons — lit up when active */
+.toggle-btn {
+  color: var(--text-muted) !important;
+  font-size: 11px !important;
+  letter-spacing: 0.04em;
+}
+
+.toggle-btn.active {
+  color: #fff !important;
+  background: var(--accent) !important;
+}
+
+/* ==============================
+   Time & Filename Display
+============================== */
+#time-display {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  padding: 0 8px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+#filename-display {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 400px;
+  text-align: center;
+}
+
+/* ==============================
+   Speed Group
+============================== */
+#speed-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 4px;
+}
+
+#speed-bar {
+  width: 92px;
+  height: 3px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--speed-fill, 42.86%),
+    rgba(255, 255, 255, 0.22) var(--speed-fill, 42.86%),
+    rgba(255, 255, 255, 0.22) 100%
+  );
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+#speed-bar::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #fff;
+  cursor: pointer;
+}
+
+#btn-speed-reset {
+  min-width: 40px !important;
+  font-size: 12px !important;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted) !important;
+}
+
+#btn-speed-reset.active {
+  color: #fff !important;
+}
+
+/* ==============================
+   Volume Group
+============================== */
+#volume-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+#volume-bar {
+  width: 72px;
+  height: 3px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+#volume-bar::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #fff;
+  cursor: pointer;
+}
+
+/* Editor button — dimmed when no path is configured */
+#btn-editor {
+  opacity: 0.45;
+}
+
+#btn-editor.has-editor {
+  opacity: 1;
+}
+
+/* ==============================
+   Fullscreen Adjustments
+============================== */
+:-webkit-full-screen #titlebar {
+  display: none;
+}
+
+:-webkit-full-screen #player-container {
+  top: 0;
+}

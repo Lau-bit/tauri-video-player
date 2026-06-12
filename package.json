@@ -1,0 +1,21 @@
+{
+  "name": "video-player-tauri",
+  "version": "1.0.0",
+  "description": "Minimalist video player, ported to Tauri",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tauri dev",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri",
+    "check": "node --check src/api.js && node --check src/renderer.js"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
