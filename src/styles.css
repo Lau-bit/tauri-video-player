@@ -41,6 +41,11 @@ button {
   cursor: pointer;
 }
 
+button:focus,
+input:focus {
+  outline: none;
+}
+
 /* ==============================
    Title Bar
 ============================== */
@@ -95,7 +100,13 @@ button {
   color: #fff !important;
 }
 
-body.no-ui #titlebar {
+body.no-ui #titlebar,
+body.zoom-fill #titlebar {
+  background: transparent;
+}
+
+body.no-ui #titlebar-controls,
+body.zoom-fill #titlebar-controls {
   opacity: 0;
   pointer-events: none;
 }
@@ -109,6 +120,11 @@ body.no-ui #titlebar {
   margin-top: var(--titlebar-height);
   min-height: 0;
   overflow: hidden;
+}
+
+body.no-ui #player-container,
+body.zoom-fill #player-container {
+  margin-top: 0;
 }
 
 /* ==============================
@@ -289,8 +305,9 @@ body.has-video #empty-state {
   padding: 8px 12px 10px;
 }
 
-body.no-ui #controls {
-  visibility: hidden; /* bar stays, content hidden */
+body.no-ui #controls,
+body.zoom-fill #controls {
+  display: none;
 }
 
 /* ==============================
@@ -298,6 +315,70 @@ body.no-ui #controls {
 ============================== */
 #seekbar-row {
   padding: 0 2px 6px;
+}
+
+#seekbar-wrap {
+  position: relative;
+  width: 100%;
+}
+
+/* ==============================
+   Section Markers (A-B loop)
+============================== */
+#section-markers {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: none;
+}
+
+body.section-loop-active #section-markers {
+  display: block;
+}
+
+#section-region {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 3px;
+  background: rgba(255, 255, 255, 0.18);
+  pointer-events: none;
+}
+
+.section-marker {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 14px;
+  background: var(--accent);
+  border-radius: 1.5px;
+  pointer-events: auto;
+  cursor: ew-resize;
+  z-index: 2;
+}
+
+.section-marker:hover {
+  width: 5px;
+}
+
+#section-drag-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.82);
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  display: none;
+  z-index: 10;
+}
+
+#section-drag-tooltip.visible {
+  display: block;
 }
 
 #seekbar {
@@ -415,6 +496,14 @@ body.no-ui #controls {
   stroke-linejoin: round;
 }
 
+#control-bar #btn-save-section {
+  display: none;
+}
+
+body.section-loop-active #control-bar #btn-save-section {
+  display: flex;
+}
+
 /* Toggle buttons — lit up when active */
 .toggle-btn {
   color: var(--text-muted) !important;
@@ -457,6 +546,25 @@ body.no-ui #controls {
   align-items: center;
   gap: 2px;
   margin-right: 4px;
+}
+
+.speed-bar-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.speed-bar-marker {
+  position: absolute;
+  /* (1.0 - 0.25) / (2.0 - 0.25) = 42.857% — aligns with the thumb at 1.0x */
+  left: calc(42.857% - 5px);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 10px;
+  height: 10px;
+  background: rgba(255, 255, 255, 0.38);
+  border-radius: 2px;
+  cursor: pointer;
 }
 
 #speed-bar {
@@ -532,6 +640,19 @@ body.no-ui #controls {
 
 #btn-editor.has-editor {
   opacity: 1;
+}
+
+/* ==============================
+   Zoom-to-Fill Mode
+============================== */
+body.zoom-fill #video {
+  object-fit: cover;
+  object-position: var(--pan-x, 50%) var(--pan-y, 50%);
+  cursor: grab;
+}
+
+body.zoom-fill.panning #video {
+  cursor: grabbing;
 }
 
 /* ==============================

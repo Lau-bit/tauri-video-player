@@ -531,6 +531,44 @@ fn cancel_transcode(state: tauri::State<'_, AppState>) {
 }
 
 #[tauri::command]
+fn save_section(
+    file_path: String,
+    start: f64,
+    end: f64,
+    output_path: String,
+) -> Result<(), String> {
+    let duration = end - start;
+    if duration <= 0.0 {
+        return Err("Invalid section: end must be after start".to_string());
+    }
+    let mut cmd = Command::new("ffmpeg");
+    if start > 0.01 {
+        cmd.args(["-ss", &format!("{:.3}", start)]);
+    }
+    cmd.args([
+        "-i",
+        &file_path,
+        "-t",
+        &format!("{:.3}", duration),
+        "-c",
+        "copy",
+        "-y",
+        &output_path,
+    ]);
+    let status = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let _ = fs::remove_file(&output_path);
+        Err(format!("ffmpeg exited with code {:?}", status.code()))
+    }
+}
+
+#[tauri::command]
 fn cleanup_temp(state: tauri::State<'_, AppState>, file_path: String) {
     let path = PathBuf::from(file_path);
     let _ = fs::remove_file(&path);
@@ -606,6 +644,7 @@ pub fn run() {
             set_autoplay_switched,
             set_editor_path,
             transcode_file,
+            save_section,
             window_close,
             window_is_fullscreen,
             window_is_maximized,
@@ -614,8 +653,8 @@ pub fn run() {
             window_toggle_fullscreen,
             window_toggle_maximize
         ])
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { .. } => {
                 let state = window.state::<AppState>();
                 kill_running_transcode(&state);
                 let paths = state
@@ -627,6 +666,13 @@ pub fn run() {
                     let _ = fs::remove_file(path);
                 }
             }
+            tauri::WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                // WebView2 loses its render surface when moved to a monitor with a
+                // different DPI scale. Forcing set_size with the new size triggers
+                // WebView2 to reinitialize the surface and clears the black screen.
+                let _ = window.set_size(tauri::Size::Physical(*new_inner_size));
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

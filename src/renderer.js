@@ -11,19 +11,28 @@ const state = {
   autoSwitch: false,
   autoplaySwitched: true,
   noUI: false,
+  zoomFill: false,
+  panX: 50,
+  panY: 50,
+  zoomFillPrevNoUI: false,
   uiHideTimer: null,
   playbackRate: 1,
   tempFile: null,           // path of current transcoded temp file
   transcodeCancel: null,    // cleanup fn for transcode-progress listener
   pausedForHiddenWindow: false,
   closing: false,
+  sectionLoop: false,
+  sectionStart: 0,
+  sectionEnd: 0,
 };
+
+// Per-video section positions remembered within the session (filePath → {start, end})
+const sectionPositions = new Map();
 
 const UI_HIDE_DELAY = 350; // ms — how long after mouse leaves before controls hide
 const MIN_PLAYBACK_RATE = 0.25;
 const MAX_PLAYBACK_RATE = 2;
 const PLAYBACK_RATE_STEP = 0.05;
-const AUTOPLAY_SWITCHED_STORAGE_KEY = 'video-player:autoplay-switched:v1';
 let loadSequence = 0;
 
 // ==============================
@@ -40,6 +49,7 @@ const btnAutoplaySwitched = document.getElementById('btn-autoplay-switched');
 const btnSpeedDown  = document.getElementById('btn-speed-down');
 const btnSpeedReset = document.getElementById('btn-speed-reset');
 const btnSpeedUp    = document.getElementById('btn-speed-up');
+const speedBarMarker = document.querySelector('.speed-bar-marker');
 const btnPrev       = document.getElementById('btn-prev');
 const btnNext       = document.getElementById('btn-next');
 const btnOpen       = document.getElementById('btn-open');
@@ -57,7 +67,14 @@ const controls      = document.getElementById('controls');
 const transcodeMsg  = document.getElementById('transcode-msg');
 const transcodeBar  = document.getElementById('transcode-bar');
 const transcodePct  = document.getElementById('transcode-pct');
-const btnCancelTranscode = document.getElementById('btn-cancel-transcode');
+const btnCancelTranscode  = document.getElementById('btn-cancel-transcode');
+const btnSectionLoop      = document.getElementById('btn-section-loop');
+const btnSaveSection      = document.getElementById('btn-save-section');
+const sectionMarkers      = document.getElementById('section-markers');
+const sectionMarkerStart  = document.getElementById('section-marker-start');
+const sectionMarkerEnd    = document.getElementById('section-marker-end');
+const sectionRegion       = document.getElementById('section-region');
+const sectionDragTooltip  = document.getElementById('section-drag-tooltip');
 
 // ==============================
 // Maximize Button State
@@ -107,32 +124,8 @@ function applyAutoplaySwitched(value) {
   btnAutoplaySwitched.classList.toggle('active', state.autoplaySwitched);
 }
 
-function loadLocalAutoplaySwitchedSetting() {
-  try {
-    const value = localStorage.getItem(AUTOPLAY_SWITCHED_STORAGE_KEY);
-    if (value === null) return null;
-    return value === 'true';
-  } catch {
-    return null;
-  }
-}
-
-function saveLocalAutoplaySwitchedSetting(value) {
-  try {
-    localStorage.setItem(AUTOPLAY_SWITCHED_STORAGE_KEY, String(value));
-  } catch {
-    // The Rust settings file is the primary persistent store.
-  }
-}
-
 async function loadAutoplaySwitchedSetting() {
   const manualChangesAtLoadStart = autoplaySwitchedManualChanges;
-  const localValue = loadLocalAutoplaySwitchedSetting();
-  if (localValue !== null) {
-    applyAutoplaySwitched(localValue);
-    return;
-  }
-
   try {
     const savedValue = await window.videoAPI.getAutoplaySwitched();
     if (manualChangesAtLoadStart === autoplaySwitchedManualChanges) {
@@ -164,7 +157,19 @@ async function loadFile(filePath, forcePlay = false) {
     state.tempFile = null;
   }
 
+  // Save section positions for the video we're leaving
+  if (state.sectionLoop && state.filePath) {
+    sectionPositions.set(state.filePath, { start: state.sectionStart, end: state.sectionEnd });
+  }
+
   state.filePath = filePath;
+
+  // Restore or reset section positions for the incoming video
+  if (state.sectionLoop) {
+    const saved = sectionPositions.get(filePath);
+    state.sectionStart = saved ? saved.start : 0;
+    state.sectionEnd   = saved ? saved.end   : 0; // 0 = unknown until loadedmetadata
+  }
 
   // Get all video files in the same folder (natural sort, from main process)
   state.folderFiles = await window.videoAPI.getFolderFiles(filePath);
@@ -212,7 +217,12 @@ function navigateFolder(delta) {
 function togglePlayPause() {
   if (!video.src) return;
   if (video.paused) {
-    playVideoWhenReady();
+    if (state.sectionLoop && isFinite(video.duration) && video.currentTime >= state.sectionEnd - 0.1) {
+      video.currentTime = state.sectionStart;
+      video.addEventListener('seeked', () => video.play().catch(() => {}), { once: true });
+    } else {
+      playVideoWhenReady();
+    }
   } else {
     video.pause();
   }
@@ -269,8 +279,10 @@ function formatPlaybackRate(rate) {
   return Number(rate.toFixed(2)).toString() + 'x';
 }
 
-function updateSpeedControls() {
-  speedBar.value = state.playbackRate.toFixed(2);
+function updateSpeedControls(skipSliderUpdate = false) {
+  if (!skipSliderUpdate) {
+    speedBar.value = state.playbackRate.toFixed(2);
+  }
   btnSpeedReset.textContent = formatPlaybackRate(state.playbackRate);
   btnSpeedReset.classList.toggle('active', state.playbackRate !== 1);
   btnSpeedDown.disabled = state.playbackRate <= MIN_PLAYBACK_RATE;
@@ -280,10 +292,10 @@ function updateSpeedControls() {
   speedBar.style.setProperty('--speed-fill', pct.toFixed(2) + '%');
 }
 
-function setPlaybackRate(rate) {
+function setPlaybackRate(rate, fromSlider = false) {
   state.playbackRate = Number(clampPlaybackRate(rate).toFixed(2));
   video.playbackRate = state.playbackRate;
-  updateSpeedControls();
+  updateSpeedControls(fromSlider);
 }
 
 function adjustPlaybackRate(delta) {
@@ -293,10 +305,66 @@ function adjustPlaybackRate(delta) {
 // ==============================
 // Loop
 // ==============================
+// Native video.loop must stay OFF while an A-B section is active: the browser
+// seeks to 0 (the true start) when playback hits video.duration, which bypasses
+// the section boundaries entirely. When a section is set, looping is handled
+// manually by the timeupdate/ended logic so the markers are always respected.
+function applyLoopMode() {
+  video.loop = state.loop && !state.sectionLoop;
+}
+
 function toggleLoop() {
   state.loop = !state.loop;
-  video.loop = state.loop;
+  applyLoopMode();
   btnLoop.classList.toggle('active', state.loop);
+}
+
+// ==============================
+// Section Loop (A-B)
+// ==============================
+function updateSectionMarkers() {
+  if (!isFinite(video.duration) || video.duration === 0) return;
+  const startPct = (state.sectionStart / video.duration) * 100;
+  const endPct   = (state.sectionEnd   / video.duration) * 100;
+  sectionMarkerStart.style.left = startPct.toFixed(3) + '%';
+  sectionMarkerEnd.style.left   = endPct.toFixed(3)   + '%';
+  sectionRegion.style.left      = startPct.toFixed(3) + '%';
+  sectionRegion.style.width     = (endPct - startPct).toFixed(3) + '%';
+}
+
+function enableSectionLoop() {
+  const dur   = isFinite(video.duration) ? video.duration : 0;
+  const saved = sectionPositions.get(state.filePath);
+  if (saved) {
+    state.sectionStart = saved.start;
+    state.sectionEnd   = dur > 0 ? Math.min(saved.end, dur) : saved.end;
+  } else {
+    state.sectionStart = 0;
+    state.sectionEnd   = dur;
+  }
+  state.sectionLoop = true;
+  applyLoopMode();
+  document.body.classList.add('section-loop-active');
+  btnSectionLoop.classList.add('active');
+  updateSectionMarkers();
+}
+
+function disableSectionLoop() {
+  if (state.filePath) {
+    sectionPositions.set(state.filePath, { start: state.sectionStart, end: state.sectionEnd });
+  }
+  state.sectionLoop = false;
+  applyLoopMode();
+  document.body.classList.remove('section-loop-active');
+  btnSectionLoop.classList.remove('active');
+}
+
+function toggleSectionLoop() {
+  if (state.sectionLoop) {
+    disableSectionLoop();
+  } else {
+    enableSectionLoop();
+  }
 }
 
 // ==============================
@@ -311,7 +379,6 @@ async function toggleAutoplaySwitched() {
   autoplaySwitchedManualChanges += 1;
   const next = !state.autoplaySwitched;
   applyAutoplaySwitched(next);
-  saveLocalAutoplaySwitchedSetting(next);
   await window.videoAPI.setAutoplaySwitched(next).catch(() => {});
 }
 
@@ -320,7 +387,7 @@ async function toggleAutoplaySwitched() {
 // ==============================
 function showUI() {
   clearTimeout(state.uiHideTimer);
-  if (state.noUI) return;
+  if (state.noUI || state.zoomFill) return;
   document.body.classList.add('ui-visible');
 }
 
@@ -343,6 +410,48 @@ function toggleNoUI() {
   } else {
     clearTimeout(state.uiHideTimer);
     document.body.classList.remove('ui-visible');
+  }
+}
+
+// ==============================
+// Zoom-to-Fill Mode
+// ==============================
+function applyPan() {
+  video.style.setProperty('--pan-x', state.panX.toFixed(2) + '%');
+  video.style.setProperty('--pan-y', state.panY.toFixed(2) + '%');
+}
+
+function recenterPan() {
+  state.panX = 50;
+  state.panY = 50;
+  applyPan();
+}
+
+function enterZoomFill() {
+  state.zoomFillPrevNoUI = state.noUI;
+  state.zoomFill = true;
+  clearTimeout(state.uiHideTimer);
+  document.body.classList.remove('ui-visible');
+  document.body.classList.add('zoom-fill');
+  applyPan();
+}
+
+function exitZoomFill() {
+  state.zoomFill = false;
+  isPanning = false;
+  document.body.classList.remove('zoom-fill');
+  document.body.classList.remove('panning');
+  if (!state.zoomFillPrevNoUI) {
+    showUI();
+    scheduleHideUI();
+  }
+}
+
+function toggleZoomFill() {
+  if (state.zoomFill) {
+    exitZoomFill();
+  } else {
+    enterZoomFill();
   }
 }
 
@@ -426,13 +535,37 @@ function leaveHiddenWindowState() {
 video.addEventListener('play', updatePlayBtn);
 video.addEventListener('pause', updatePlayBtn);
 video.addEventListener('emptied', updateTimelineDisplay);
-video.addEventListener('loadedmetadata', updateTimelineDisplay);
+video.addEventListener('loadedmetadata', () => {
+  updateTimelineDisplay();
+  if (state.sectionLoop) {
+    if (state.sectionEnd === 0) state.sectionEnd = video.duration;
+    updateSectionMarkers();
+  }
+});
 video.addEventListener('durationchange', updateTimelineDisplay);
 video.addEventListener('timeupdate', updateTimelineDisplay);
+video.addEventListener('timeupdate', () => {
+  if (!state.sectionLoop || !isFinite(video.duration)) return;
+  if (video.currentTime >= state.sectionEnd) {
+    if (state.loop) {
+      video.currentTime = state.sectionStart;
+    } else {
+      video.currentTime = state.sectionEnd;
+      video.pause();
+    }
+  }
+});
 video.addEventListener('seeked', updateTimelineDisplay);
 
 video.addEventListener('ended', () => {
-  // video.loop handles actual looping natively; this fires if loop is off
+  // Native video.loop handles whole-video looping; this fires when it's off,
+  // including section+loop (native loop is suppressed during sections) where
+  // the section end coincides with the true end of the video.
+  if (state.sectionLoop && state.loop) {
+    video.currentTime = state.sectionStart;
+    video.play().catch(() => {});
+    return;
+  }
   if (state.autoSwitch) {
     navigateFolder(1);
   }
@@ -524,7 +657,13 @@ video.addEventListener('ratechange', () => {
 });
 
 // Play/pause on click (pointer-events:none on controls when hidden means clicks land here)
-video.addEventListener('click', togglePlayPause);
+// Long holds/drags (300+ms) are intentionally ignored.
+let videoPointerDownAt = 0;
+video.addEventListener('pointerdown', () => { videoPointerDownAt = Date.now(); });
+video.addEventListener('click', () => {
+  if (state.zoomFill && panMoved) return;
+  if (Date.now() - videoPointerDownAt <= 300) togglePlayPause();
+});
 
 
 // ==============================
@@ -536,7 +675,11 @@ seekbar.addEventListener('mousedown', () => { isScrubbing = true; });
 
 seekbar.addEventListener('input', () => {
   if (!video.duration || !isFinite(video.duration)) return;
-  video.currentTime = (seekbar.value / 10000) * video.duration;
+  let t = (seekbar.value / 10000) * video.duration;
+  if (state.sectionLoop) {
+    t = Math.max(state.sectionStart, Math.min(state.sectionEnd, t));
+  }
+  video.currentTime = t;
 });
 
 document.addEventListener('mouseup', () => { isScrubbing = false; });
@@ -564,12 +707,36 @@ btnMute.addEventListener('click', () => {
 // Playback Speed
 // ==============================
 speedBar.addEventListener('input', () => {
-  setPlaybackRate(Number(speedBar.value));
+  setPlaybackRate(Number(speedBar.value), true);
 });
 
 btnSpeedDown.addEventListener('click', () => adjustPlaybackRate(-PLAYBACK_RATE_STEP));
 btnSpeedUp.addEventListener('click', () => adjustPlaybackRate(PLAYBACK_RATE_STEP));
 btnSpeedReset.addEventListener('click', () => setPlaybackRate(1));
+speedBarMarker.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  const startX = e.clientX;
+  let moved = false;
+
+  const onMove = (moveEvent) => {
+    if (!moved && Math.abs(moveEvent.clientX - startX) < 4) return;
+    moved = true;
+    const rect = speedBar.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (moveEvent.clientX - rect.left) / rect.width));
+    const rawRate = MIN_PLAYBACK_RATE + pct * (MAX_PLAYBACK_RATE - MIN_PLAYBACK_RATE);
+    const step = Number(speedBar.step);
+    setPlaybackRate(Math.round(rawRate / step) * step);
+  };
+
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    if (!moved) setPlaybackRate(1);
+  };
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+});
 
 // ==============================
 // Hover UI Show/Hide
@@ -583,10 +750,132 @@ titlebar.addEventListener('mouseenter', () => clearTimeout(state.uiHideTimer));
 titlebar.addEventListener('mouseleave', scheduleHideUI);
 
 // ==============================
+// Zoom-to-Fill Pan (mouse drag)
+// ==============================
+let isPanning = false;
+let panMoved = false;
+let panLastX = 0;
+let panLastY = 0;
+
+playerContainer.addEventListener('mousedown', (e) => {
+  if (!state.zoomFill || e.button !== 0) return;
+  isPanning = true;
+  panMoved = false;
+  panLastX = e.clientX;
+  panLastY = e.clientY;
+  document.body.classList.add('panning');
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!isPanning) return;
+  const dx = e.clientX - panLastX;
+  const dy = e.clientY - panLastY;
+  panLastX = e.clientX;
+  panLastY = e.clientY;
+  if (Math.abs(dx) > 0 || Math.abs(dy) > 0) panMoved = true;
+
+  const rect = playerContainer.getBoundingClientRect();
+  const videoAspect = (video.videoWidth || 16) / (video.videoHeight || 9);
+  const containerAspect = rect.width / rect.height;
+
+  if (videoAspect > containerAspect) {
+    // Video wider than container — horizontal overflow, pan X only
+    const renderedW = rect.height * videoAspect;
+    const overflow = Math.max(0.01, renderedW - rect.width);
+    state.panX = Math.max(0, Math.min(100, state.panX - dx / overflow * 100));
+  } else {
+    // Video taller than container — vertical overflow, pan Y only
+    const renderedH = rect.width / videoAspect;
+    const overflow = Math.max(0.01, renderedH - rect.height);
+    state.panY = Math.max(0, Math.min(100, state.panY - dy / overflow * 100));
+  }
+
+  applyPan();
+});
+
+document.addEventListener('mouseup', () => {
+  if (isPanning) {
+    isPanning = false;
+    document.body.classList.remove('panning');
+  }
+});
+
+// ==============================
 // Button Click Handlers
 // ==============================
+function startSectionMarkerDrag(isStart) {
+  return (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const onMove = (moveEvent) => {
+      if (!isFinite(video.duration) || video.duration === 0) return;
+      const rect = seekbar.getBoundingClientRect();
+      const pct  = Math.max(0, Math.min(1, (moveEvent.clientX - rect.left) / rect.width));
+      const time = pct * video.duration;
+      if (isStart) {
+        state.sectionStart = Math.max(0, Math.min(time, state.sectionEnd - 0.25));
+      } else {
+        state.sectionEnd = Math.min(video.duration, Math.max(time, state.sectionStart + 0.25));
+      }
+      updateSectionMarkers();
+      if (video.currentTime < state.sectionStart) {
+        video.currentTime = state.sectionStart;
+      } else if (video.currentTime > state.sectionEnd) {
+        video.currentTime = state.sectionEnd;
+      }
+      const markerTime = isStart ? state.sectionStart : state.sectionEnd;
+      sectionDragTooltip.textContent = formatTime(markerTime);
+      sectionDragTooltip.style.left = ((markerTime / video.duration) * 100).toFixed(3) + '%';
+      sectionDragTooltip.classList.add('visible');
+    };
+
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      sectionDragTooltip.classList.remove('visible');
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+}
+
+sectionMarkerStart.addEventListener('mousedown', startSectionMarkerDrag(true));
+sectionMarkerEnd.addEventListener('mousedown', startSectionMarkerDrag(false));
+
+btnSaveSection.addEventListener('click', async () => {
+  if (!state.filePath || !state.sectionLoop || !isFinite(video.duration)) return;
+
+  const srcNorm = state.filePath.replace(/\\/g, '/');
+  const dir     = srcNorm.includes('/') ? srcNorm.slice(0, srcNorm.lastIndexOf('/')) : '';
+  const base    = srcNorm.split('/').pop();
+  const stem    = base.includes('.') ? base.slice(0, base.lastIndexOf('.')) : base;
+  const defaultPath = (dir ? dir + '/' : '') + stem + '_cut.mp4';
+
+  const outputPath = await window.videoAPI.saveSectionDialog(defaultPath.replace(/\//g, '\\'));
+  if (!outputPath) return;
+
+  const prevName = filenameDisplay.textContent;
+  filenameDisplay.textContent = 'Saving A-B section…';
+  btnSaveSection.disabled = true;
+
+  try {
+    await window.videoAPI.saveSection(state.filePath, state.sectionStart, state.sectionEnd, outputPath);
+    const savedName = outputPath.replace(/\\/g, '/').split('/').pop();
+    filenameDisplay.textContent = 'Saved: ' + savedName;
+    setTimeout(() => { filenameDisplay.textContent = prevName; }, 3000);
+  } catch (err) {
+    filenameDisplay.textContent = '⚠ Save failed: ' + (err?.message || String(err));
+    setTimeout(() => { filenameDisplay.textContent = prevName; }, 4000);
+  } finally {
+    btnSaveSection.disabled = false;
+  }
+});
+
 btnPlay.addEventListener('click', togglePlayPause);
 btnLoop.addEventListener('click', toggleLoop);
+btnSectionLoop.addEventListener('click', toggleSectionLoop);
 btnAutoSwitch.addEventListener('click', toggleAutoSwitch);
 btnAutoplaySwitched.addEventListener('click', toggleAutoplaySwitched);
 btnPrev.addEventListener('click', () => navigateFolder(-1));
@@ -631,6 +920,15 @@ document.addEventListener('keydown', async (e) => {
   // Never steal from text inputs (none expected, but defensive)
   if (focused && focused.tagName === 'INPUT' && focused.type !== 'range') return;
 
+  // Blur any focused UI control on keyboard shortcuts to prevent focus ring highlights.
+  // Volume/speed bars keep focus only when navigated with their own arrow keys.
+  if (focused && focused !== document.body) {
+    const keepFocus = isRangeInput &&
+      (focused === volumeBar || focused === speedBar) &&
+      (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown');
+    if (!keepFocus) focused.blur();
+  }
+
   switch (true) {
     case e.code === 'Space' && !e.shiftKey && !e.ctrlKey && !e.metaKey: {
       e.preventDefault();
@@ -650,16 +948,18 @@ document.addEventListener('keydown', async (e) => {
       break;
     }
 
-    case e.key === 'ArrowLeft' && !isRangeInput: {
+    case e.key === 'ArrowLeft' && focused !== volumeBar && focused !== speedBar: {
       e.preventDefault();
-      video.currentTime = Math.max(0, video.currentTime - 5);
+      const leftMin = state.sectionLoop ? state.sectionStart : 0;
+      video.currentTime = Math.max(leftMin, video.currentTime - 5);
       break;
     }
 
-    case e.key === 'ArrowRight' && !isRangeInput: {
+    case e.key === 'ArrowRight' && focused !== volumeBar && focused !== speedBar: {
       e.preventDefault();
       if (isFinite(video.duration)) {
-        video.currentTime = Math.min(video.duration, video.currentTime + 5);
+        const rightMax = state.sectionLoop ? state.sectionEnd : video.duration;
+        video.currentTime = Math.min(rightMax, video.currentTime + 5);
       }
       break;
     }
@@ -751,10 +1051,28 @@ document.addEventListener('keydown', async (e) => {
       break;
     }
 
+    case e.key === 'z' || e.key === 'Z': {
+      if (!e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        toggleZoomFill();
+      }
+      break;
+    }
+
+    case e.key === 'x' || e.key === 'X': {
+      if (!e.ctrlKey && !e.metaKey && state.zoomFill) {
+        e.preventDefault();
+        recenterPan();
+      }
+      break;
+    }
+
     case e.key === 'Escape': {
       const isFS = await window.videoAPI.isFullscreen();
       if (isFS) {
         window.videoAPI.toggleFullscreen();
+      } else if (state.zoomFill) {
+        exitZoomFill();
       } else if (state.noUI) {
         toggleNoUI();
       }

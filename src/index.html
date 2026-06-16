@@ -61,7 +61,15 @@
 
     <!-- Seek bar -->
     <div id="seekbar-row">
-      <input type="range" id="seekbar" min="0" max="10000" value="0" step="1">
+      <div id="seekbar-wrap">
+        <input type="range" id="seekbar" min="0" max="10000" value="0" step="1">
+        <div id="section-markers" aria-hidden="true">
+          <div id="section-region"></div>
+          <div id="section-marker-start" class="section-marker"></div>
+          <div id="section-marker-end" class="section-marker"></div>
+          <div id="section-drag-tooltip"></div>
+        </div>
+      </div>
     </div>
 
     <!-- Control bar -->
@@ -81,11 +89,16 @@
       <div class="ctrl-group ctrl-right">
         <div id="speed-group">
           <button id="btn-speed-down" title="Slow down ([)">&#x2212;</button>
-          <input type="range" id="speed-bar" min="0.25" max="2" value="1" step="0.05" title="Playback speed">
+          <div class="speed-bar-wrap">
+            <input type="range" id="speed-bar" min="0.25" max="2" value="1" step="0.25" title="Playback speed">
+            <span class="speed-bar-marker" aria-hidden="true"></span>
+          </div>
           <button id="btn-speed-reset" title="Reset speed (0)">1x</button>
           <button id="btn-speed-up" title="Speed up (])">+</button>
         </div>
         <button id="btn-loop" class="toggle-btn" title="Loop (L)">Loop</button>
+        <button id="btn-section-loop" class="toggle-btn" title="Loop section A-B — drag markers on seekbar to set range">A-B</button>
+        <button id="btn-save-section" class="toggle-btn" title="Save A-B section as new file">Save A-B</button>
         <button id="btn-auto-switch" class="toggle-btn" title="Auto-switch to next video when current ends (A)">Next</button>
         <button id="btn-autoplay-switched" class="toggle-btn" title="Autoplay switched videos (Shift+A)">Play</button>
         <div id="volume-group">

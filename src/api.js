@@ -69,6 +69,18 @@ window.videoAPI = {
   getAutoplaySwitched: () => invoke('get_autoplay_switched'),
   setAutoplaySwitched: autoplaySwitched => invoke('set_autoplay_switched', { autoplaySwitched }),
 
+  saveSection: (filePath, start, end, outputPath) =>
+    invoke('save_section', { filePath, start, end, outputPath }),
+  saveSectionDialog: defaultPath =>
+    dialog.save({
+      title: 'Save A-B Section',
+      defaultPath,
+      filters: [
+        { name: 'MP4 Video', extensions: ['mp4'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    }),
+
   transcodeFile: filePath => invoke('transcode_file', { filePath }),
   cancelTranscode: () => invoke('cancel_transcode'),
   cleanupTemp: filePath => invoke('cleanup_temp', { filePath }),
