@@ -30,6 +30,20 @@
     <!-- The video element — no native controls -->
     <video id="video" preload="metadata"></video>
 
+    <!-- Crop overlay (shown while framing an A-B crop) -->
+    <div id="crop-overlay" aria-hidden="true">
+      <div id="crop-box">
+        <div class="crop-handle" data-handle="nw"></div>
+        <div class="crop-handle" data-handle="n"></div>
+        <div class="crop-handle" data-handle="ne"></div>
+        <div class="crop-handle" data-handle="e"></div>
+        <div class="crop-handle" data-handle="se"></div>
+        <div class="crop-handle" data-handle="s"></div>
+        <div class="crop-handle" data-handle="sw"></div>
+        <div class="crop-handle" data-handle="w"></div>
+      </div>
+    </div>
+
     <!-- Drag-and-drop overlay -->
     <div id="drop-overlay">
       <span>Drop video to open</span>
@@ -44,6 +58,14 @@
         </div>
         <p id="transcode-pct">0%</p>
         <button id="btn-cancel-transcode">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Save overlay (spinner shown while ffmpeg writes the A-B cut) -->
+    <div id="save-overlay">
+      <div id="save-box">
+        <div class="spinner" aria-hidden="true"></div>
+        <p id="save-msg">Saving A-B section&hellip;</p>
       </div>
     </div>
 
@@ -98,7 +120,9 @@
         </div>
         <button id="btn-loop" class="toggle-btn" title="Loop (L)">Loop</button>
         <button id="btn-section-loop" class="toggle-btn" title="Loop section A-B — drag markers on seekbar to set range">A-B</button>
-        <button id="btn-save-section" class="toggle-btn" title="Save A-B section as new file">Save A-B</button>
+        <button id="btn-crop" class="toggle-btn ab-only" title="Crop the saved A-B clip — drag the box on the video">Crop</button>
+        <button id="btn-strip-audio" class="toggle-btn ab-only" title="Strip audio from the saved A-B clip (resets to off on restart)">No Audio</button>
+        <button id="btn-save-section" class="toggle-btn ab-only" title="Save A-B section as new file">Save A-B</button>
         <button id="btn-auto-switch" class="toggle-btn" title="Auto-switch to next video when current ends (A)">Next</button>
         <button id="btn-autoplay-switched" class="toggle-btn" title="Autoplay switched videos (Shift+A)">Play</button>
         <div id="volume-group">

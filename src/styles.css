@@ -249,6 +249,56 @@ body.transcoding #transcode-overlay {
 }
 
 /* ==============================
+   Save Overlay (A-B export spinner)
+============================== */
+#save-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 65;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+
+body.saving #save-overlay {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#save-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 30px 44px;
+  background: #1c1c1c;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+#save-msg {
+  font-size: 14px;
+  color: var(--text);
+}
+
+/* ==============================
    Empty State
 ============================== */
 #empty-state {
@@ -381,6 +431,79 @@ body.section-loop-active #section-markers {
   display: block;
 }
 
+/* ==============================
+   Crop Overlay (A-B crop framing)
+============================== */
+#crop-overlay {
+  position: absolute;
+  /* geometry set inline to match the letterboxed video content rect */
+  overflow: hidden;         /* clips the crop-box dimming shadow to the frame */
+  pointer-events: none;     /* only the box + handles are interactive */
+  display: none;
+  z-index: 40;
+}
+
+body.crop-active #crop-overlay {
+  display: block;
+}
+
+/* Never show the framing UI while the chrome is hidden or panning a zoom-fill */
+body.no-ui #crop-overlay,
+body.zoom-fill #crop-overlay {
+  display: none;
+}
+
+#crop-box {
+  position: absolute;
+  /* left/top/width/height set inline as % of the overlay */
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.5);
+  pointer-events: auto;
+  cursor: move;
+}
+
+/* Rule-of-thirds guides */
+#crop-box::before,
+#crop-box::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+#crop-box::before {
+  border-left: 1px solid rgba(255, 255, 255, 0.22);
+  border-right: 1px solid rgba(255, 255, 255, 0.22);
+  left: 33.333%;
+  right: 33.333%;
+}
+
+#crop-box::after {
+  border-top: 1px solid rgba(255, 255, 255, 0.22);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.22);
+  top: 33.333%;
+  bottom: 33.333%;
+}
+
+.crop-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  pointer-events: auto;
+}
+
+.crop-handle[data-handle="nw"] { left: -6px;  top: -6px;  cursor: nwse-resize; }
+.crop-handle[data-handle="ne"] { right: -6px; top: -6px;  cursor: nesw-resize; }
+.crop-handle[data-handle="se"] { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.crop-handle[data-handle="sw"] { left: -6px;  bottom: -6px; cursor: nesw-resize; }
+.crop-handle[data-handle="n"]  { left: calc(50% - 6px); top: -6px;    cursor: ns-resize; }
+.crop-handle[data-handle="s"]  { left: calc(50% - 6px); bottom: -6px; cursor: ns-resize; }
+.crop-handle[data-handle="w"]  { top: calc(50% - 6px);  left: -6px;   cursor: ew-resize; }
+.crop-handle[data-handle="e"]  { top: calc(50% - 6px);  right: -6px;  cursor: ew-resize; }
+
 #seekbar {
   width: 100%;
   height: 3px;
@@ -496,11 +619,12 @@ body.section-loop-active #section-markers {
   stroke-linejoin: round;
 }
 
-#control-bar #btn-save-section {
+/* A-B-only controls (Crop, No Audio, Save A-B) — revealed with the A-B region */
+#control-bar .ab-only {
   display: none;
 }
 
-body.section-loop-active #control-bar #btn-save-section {
+body.section-loop-active #control-bar .ab-only {
   display: flex;
 }
 

@@ -264,6 +264,19 @@ fn mp4_codec_info(file_path: &Path) -> Option<Vec<String>> {
     )
 }
 
+/// Stop ffmpeg's console window from flashing up on Windows. The app is a GUI
+/// (`windows` subsystem) binary, so any spawned console process pops its own window
+/// unless we ask Windows to create it without one.
+#[cfg(windows)]
+fn no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn no_window(_cmd: &mut Command) {}
+
 fn kill_running_transcode(state: &AppState) {
     if let Ok(mut guard) = state.ffmpeg.lock() {
         if let Some(child) = guard.as_mut() {
@@ -399,7 +412,8 @@ fn transcode_file(
         .unwrap_or(0);
     let output_path = std::env::temp_dir().join(format!("vp-{}-{stamp}.mp4", std::process::id()));
 
-    let mut child = match Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .args([
             "-i",
             &file_path,
@@ -419,9 +433,9 @@ fn transcode_file(
         ])
         .arg(&output_path)
         .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-    {
+        .stdout(Stdio::null());
+    no_window(&mut command);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return TranscodeResult {
@@ -530,12 +544,26 @@ fn cancel_transcode(state: tauri::State<'_, AppState>) {
     kill_running_transcode(&state);
 }
 
+/// A-B crop rectangle, as fractions (0.0–1.0) of the displayed video frame. Kept as
+/// fractions rather than pixels so ffmpeg can evaluate them against the coded frame
+/// (`iw`/`ih`); that stays correct for anamorphic / non-square-pixel sources, where
+/// the browser's `videoWidth` (display pixels) differs from the coded width.
+#[derive(Debug, Deserialize)]
+struct CropRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
 #[tauri::command]
 fn save_section(
     file_path: String,
     start: f64,
     end: f64,
     output_path: String,
+    strip_audio: bool,
+    crop: Option<CropRect>,
 ) -> Result<(), String> {
     let duration = end - start;
     if duration <= 0.0 {
@@ -545,16 +573,47 @@ fn save_section(
     if start > 0.01 {
         cmd.args(["-ss", &format!("{:.3}", start)]);
     }
-    cmd.args([
-        "-i",
-        &file_path,
-        "-t",
-        &format!("{:.3}", duration),
-        "-c",
-        "copy",
-        "-y",
-        &output_path,
-    ]);
+    cmd.args(["-i", &file_path, "-t", &format!("{:.3}", duration)]);
+
+    if let Some(crop) = &crop {
+        // A crop needs a filter, which forces a video re-encode. Evaluate the crop
+        // against the coded frame (iw/ih) so it stays correct for anamorphic sources,
+        // and trunc(…/2)*2 forces even sizes/offsets for yuv420p. Map only the primary
+        // video (+ optional audio) so a subtitle/data stream can't derail the encode.
+        let filter = format!(
+            "crop=trunc(iw*{:.6}/2)*2:trunc(ih*{:.6}/2)*2:trunc(iw*{:.6}/2)*2:trunc(ih*{:.6}/2)*2",
+            crop.w, crop.h, crop.x, crop.y
+        );
+        cmd.args([
+            "-map",
+            "0:v:0",
+            "-vf",
+            &filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+        if strip_audio {
+            cmd.arg("-an");
+        } else {
+            cmd.args(["-map", "0:a?", "-c:a", "copy"]);
+        }
+    } else {
+        // No crop: stream-copy every track losslessly (as before), dropping only
+        // the audio when the strip toggle is on.
+        cmd.args(["-c", "copy"]);
+        if strip_audio {
+            cmd.arg("-an");
+        }
+    }
+
+    cmd.args(["-y", &output_path]);
+    no_window(&mut cmd);
     let status = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())

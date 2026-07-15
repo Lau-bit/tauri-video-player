@@ -69,8 +69,8 @@ window.videoAPI = {
   getAutoplaySwitched: () => invoke('get_autoplay_switched'),
   setAutoplaySwitched: autoplaySwitched => invoke('set_autoplay_switched', { autoplaySwitched }),
 
-  saveSection: (filePath, start, end, outputPath) =>
-    invoke('save_section', { filePath, start, end, outputPath }),
+  saveSection: (filePath, start, end, outputPath, stripAudio, crop) =>
+    invoke('save_section', { filePath, start, end, outputPath, stripAudio, crop: crop ?? null }),
   saveSectionDialog: defaultPath =>
     dialog.save({
       title: 'Save A-B Section',

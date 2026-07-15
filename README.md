@@ -7,6 +7,8 @@ Minimalist desktop video player built with Tauri 2 and vanilla HTML/CSS/JS. Dark
 - Drag-and-drop to open, or use the file picker
 - Folder navigation — cycle through videos in the same directory (sorted by date)
 - A-B section loop — drag markers on the seekbar to set a region, loop it, or export it via ffmpeg
+  - **Crop** — drag the on-video box to frame the exported clip (re-encoded; no crop = lossless stream-copy)
+  - **No Audio** — strip the audio track from the exported clip (session-only toggle, resets to off on restart)
 - Auto-transcode — unsupported codecs (e.g. HEVC, AV1) trigger an automatic ffmpeg re-encode to H.264
 - Playback speed control (0.25×–2×) with a drag-reset marker
 - Zoom-to-fill mode with mouse panning

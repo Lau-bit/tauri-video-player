@@ -24,7 +24,19 @@ const state = {
   sectionLoop: false,
   sectionStart: 0,
   sectionEnd: 0,
+  stripAudio: false,        // strip audio from saved A-B cut — resets on restart (never persisted)
+  cropActive: false,        // A-B crop framing overlay shown
+  crop: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, // normalized (0-1) crop rect, relative to the video frame
 };
+
+// A crop is (re)set to this centered 80% inset each time a new file loads.
+function defaultCrop() {
+  return { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 // Per-video section positions remembered within the session (filePath → {start, end})
 const sectionPositions = new Map();
@@ -69,7 +81,12 @@ const transcodeBar  = document.getElementById('transcode-bar');
 const transcodePct  = document.getElementById('transcode-pct');
 const btnCancelTranscode  = document.getElementById('btn-cancel-transcode');
 const btnSectionLoop      = document.getElementById('btn-section-loop');
+const btnCrop             = document.getElementById('btn-crop');
+const btnStripAudio       = document.getElementById('btn-strip-audio');
 const btnSaveSection      = document.getElementById('btn-save-section');
+const cropOverlay         = document.getElementById('crop-overlay');
+const cropBox             = document.getElementById('crop-box');
+const saveMsg             = document.getElementById('save-msg');
 const sectionMarkers      = document.getElementById('section-markers');
 const sectionMarkerStart  = document.getElementById('section-marker-start');
 const sectionMarkerEnd    = document.getElementById('section-marker-end');
@@ -163,6 +180,10 @@ async function loadFile(filePath, forcePlay = false) {
   }
 
   state.filePath = filePath;
+
+  // Crop rect is resolution/framing-specific — start every new video fresh.
+  state.crop = defaultCrop();
+  if (state.cropActive) exitCrop();
 
   // Restore or reset section positions for the incoming video
   if (state.sectionLoop) {
@@ -357,6 +378,7 @@ function disableSectionLoop() {
   applyLoopMode();
   document.body.classList.remove('section-loop-active');
   btnSectionLoop.classList.remove('active');
+  if (state.cropActive) exitCrop(); // crop controls live inside the A-B group
 }
 
 function toggleSectionLoop() {
@@ -365,6 +387,128 @@ function toggleSectionLoop() {
   } else {
     enableSectionLoop();
   }
+}
+
+// ==============================
+// A-B Crop (framing overlay)
+// ==============================
+// The crop rect (state.crop) is stored normalized to the video frame (0-1), so it
+// is display-independent. The overlay is positioned over the letterboxed content
+// rect (object-fit: contain), so those normalized coords map straight onto it.
+function getContentRect() {
+  const cw = playerContainer.clientWidth;
+  const ch = playerContainer.clientHeight;
+  const vw = video.videoWidth || 16;
+  const vh = video.videoHeight || 9;
+  const scale = Math.min(cw / vw, ch / vh);
+  const w = vw * scale;
+  const h = vh * scale;
+  return { left: (cw - w) / 2, top: (ch - h) / 2, width: w, height: h };
+}
+
+function positionCropBox() {
+  cropBox.style.left   = (state.crop.x * 100).toFixed(3) + '%';
+  cropBox.style.top    = (state.crop.y * 100).toFixed(3) + '%';
+  cropBox.style.width  = (state.crop.w * 100).toFixed(3) + '%';
+  cropBox.style.height = (state.crop.h * 100).toFixed(3) + '%';
+}
+
+function updateCropOverlay() {
+  if (!state.cropActive) return;
+  const rect = getContentRect();
+  cropOverlay.style.left   = rect.left + 'px';
+  cropOverlay.style.top    = rect.top + 'px';
+  cropOverlay.style.width  = rect.width + 'px';
+  cropOverlay.style.height = rect.height + 'px';
+  positionCropBox();
+}
+
+function startCropDrag(mode, handle) {
+  return (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = cropOverlay.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const orig = { ...state.crop };
+    const minW = Math.min(0.5, 24 / rect.width);   // min box size, in normalized units
+    const minH = Math.min(0.5, 24 / rect.height);
+
+    const onMove = (ev) => {
+      const dx = (ev.clientX - startX) / rect.width;
+      const dy = (ev.clientY - startY) / rect.height;
+      if (mode === 'move') {
+        state.crop.x = clamp(orig.x + dx, 0, 1 - orig.w);
+        state.crop.y = clamp(orig.y + dy, 0, 1 - orig.h);
+      } else {
+        let left = orig.x, top = orig.y, right = orig.x + orig.w, bottom = orig.y + orig.h;
+        if (handle.includes('w')) left   = clamp(orig.x + dx, 0, right - minW);
+        if (handle.includes('e')) right  = clamp(right + dx, left + minW, 1);
+        if (handle.includes('n')) top    = clamp(orig.y + dy, 0, bottom - minH);
+        if (handle.includes('s')) bottom = clamp(bottom + dy, top + minH, 1);
+        state.crop.x = left;
+        state.crop.y = top;
+        state.crop.w = right - left;
+        state.crop.h = bottom - top;
+      }
+      positionCropBox();
+    };
+
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+}
+
+function enterCrop() {
+  state.cropActive = true;
+  document.body.classList.add('crop-active');
+  btnCrop.classList.add('active');
+  updateCropOverlay();
+}
+
+function exitCrop() {
+  state.cropActive = false;
+  document.body.classList.remove('crop-active');
+  btnCrop.classList.remove('active');
+}
+
+function toggleCrop() {
+  if (state.cropActive) {
+    exitCrop();
+  } else {
+    enterCrop();
+  }
+}
+
+// Resolve the crop for saving as fractions (0-1) of the video frame. Fractions (not
+// pixels) go to the backend so ffmpeg evaluates them against the coded frame — correct
+// even for anamorphic sources — and forces even dimensions itself. Returns null when
+// the rect covers (essentially) the whole frame, so a full-frame "crop" saves via
+// lossless stream-copy instead of a pointless re-encode.
+function computeCrop() {
+  if (!video.videoWidth || !video.videoHeight) return null;
+  let { x, y, w, h } = state.crop;
+  x = clamp(x, 0, 1);
+  y = clamp(y, 0, 1);
+  w = clamp(w, 0, 1 - x);
+  h = clamp(h, 0, 1 - y);
+  if (w <= 0 || h <= 0) return null;
+  if (x <= 0.002 && y <= 0.002 && w >= 0.998 && h >= 0.998) return null;
+  return { x, y, w, h };
+}
+
+// ==============================
+// Strip Audio (save option)
+// ==============================
+function toggleStripAudio() {
+  state.stripAudio = !state.stripAudio;
+  btnStripAudio.classList.toggle('active', state.stripAudio);
 }
 
 // ==============================
@@ -541,6 +685,7 @@ video.addEventListener('loadedmetadata', () => {
     if (state.sectionEnd === 0) state.sectionEnd = video.duration;
     updateSectionMarkers();
   }
+  updateCropOverlay(); // video dimensions now known — realign the crop content rect
 });
 video.addEventListener('durationchange', updateTimelineDisplay);
 video.addEventListener('timeupdate', updateTimelineDisplay);
@@ -844,6 +989,19 @@ function startSectionMarkerDrag(isStart) {
 sectionMarkerStart.addEventListener('mousedown', startSectionMarkerDrag(true));
 sectionMarkerEnd.addEventListener('mousedown', startSectionMarkerDrag(false));
 
+// Crop box: drag the body to move, drag a handle to resize.
+cropBox.addEventListener('mousedown', (e) => {
+  if (e.target.classList.contains('crop-handle')) return;
+  startCropDrag('move')(e);
+});
+cropBox.querySelectorAll('.crop-handle').forEach((handle) => {
+  handle.addEventListener('mousedown', startCropDrag('resize', handle.dataset.handle));
+});
+
+// Keep the crop overlay aligned with the letterboxed video as the window resizes.
+const cropResizeObserver = new ResizeObserver(() => updateCropOverlay());
+cropResizeObserver.observe(playerContainer);
+
 btnSaveSection.addEventListener('click', async () => {
   if (!state.filePath || !state.sectionLoop || !isFinite(video.duration)) return;
 
@@ -856,12 +1014,18 @@ btnSaveSection.addEventListener('click', async () => {
   const outputPath = await window.videoAPI.saveSectionDialog(defaultPath.replace(/\//g, '\\'));
   if (!outputPath) return;
 
+  const crop = state.cropActive ? computeCrop() : null;
+  const stripAudio = state.stripAudio;
+
   const prevName = filenameDisplay.textContent;
-  filenameDisplay.textContent = 'Saving A-B section…';
+  saveMsg.textContent = crop ? 'Saving cropped A-B section…' : 'Saving A-B section…';
+  document.body.classList.add('saving');
   btnSaveSection.disabled = true;
 
   try {
-    await window.videoAPI.saveSection(state.filePath, state.sectionStart, state.sectionEnd, outputPath);
+    await window.videoAPI.saveSection(
+      state.filePath, state.sectionStart, state.sectionEnd, outputPath, stripAudio, crop,
+    );
     const savedName = outputPath.replace(/\\/g, '/').split('/').pop();
     filenameDisplay.textContent = 'Saved: ' + savedName;
     setTimeout(() => { filenameDisplay.textContent = prevName; }, 3000);
@@ -869,6 +1033,7 @@ btnSaveSection.addEventListener('click', async () => {
     filenameDisplay.textContent = '⚠ Save failed: ' + (err?.message || String(err));
     setTimeout(() => { filenameDisplay.textContent = prevName; }, 4000);
   } finally {
+    document.body.classList.remove('saving');
     btnSaveSection.disabled = false;
   }
 });
@@ -876,6 +1041,8 @@ btnSaveSection.addEventListener('click', async () => {
 btnPlay.addEventListener('click', togglePlayPause);
 btnLoop.addEventListener('click', toggleLoop);
 btnSectionLoop.addEventListener('click', toggleSectionLoop);
+btnCrop.addEventListener('click', toggleCrop);
+btnStripAudio.addEventListener('click', toggleStripAudio);
 btnAutoSwitch.addEventListener('click', toggleAutoSwitch);
 btnAutoplaySwitched.addEventListener('click', toggleAutoplaySwitched);
 btnPrev.addEventListener('click', () => navigateFolder(-1));
