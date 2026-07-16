@@ -43,7 +43,7 @@ const sectionPositions = new Map();
 
 const UI_HIDE_DELAY = 350; // ms — how long after mouse leaves before controls hide
 const MIN_PLAYBACK_RATE = 0.25;
-const MAX_PLAYBACK_RATE = 2;
+const MAX_PLAYBACK_RATE = 4;
 const PLAYBACK_RATE_STEP = 0.05;
 let loadSequence = 0;
 
@@ -309,8 +309,13 @@ function updateSpeedControls(skipSliderUpdate = false) {
   btnSpeedDown.disabled = state.playbackRate <= MIN_PLAYBACK_RATE;
   btnSpeedUp.disabled = state.playbackRate >= MAX_PLAYBACK_RATE;
 
-  const pct = ((state.playbackRate - MIN_PLAYBACK_RATE) / (MAX_PLAYBACK_RATE - MIN_PLAYBACK_RATE)) * 100;
-  speedBar.style.setProperty('--speed-fill', pct.toFixed(2) + '%');
+  // Track the thumb's centre, which is inset by half the thumb (see .speed-bar-marker
+  // in styles.css) — a flat percentage of the track leaves the fill short of the thumb.
+  const f = (state.playbackRate - MIN_PLAYBACK_RATE) / (MAX_PLAYBACK_RATE - MIN_PLAYBACK_RATE);
+  speedBar.style.setProperty(
+    '--speed-fill',
+    `calc(${f.toFixed(4)} * (100% - var(--thumb)) + var(--thumb) / 2)`
+  );
 }
 
 function setPlaybackRate(rate, fromSlider = false) {

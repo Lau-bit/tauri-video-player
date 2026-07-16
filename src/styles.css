@@ -676,12 +676,16 @@ body.section-loop-active #control-bar .ab-only {
   position: relative;
   display: flex;
   align-items: center;
+  --thumb: 11px;
 }
 
+/* A range thumb's centre is inset by half its width — it travels from --thumb/2 to
+   (track - --thumb/2), not 0 to track. So the 1.0x tick sits at
+   0.2 * (track - --thumb) + --thumb/2, where 0.2 = (1.0-0.25)/(4.0-0.25). A flat 20%
+   of the track drifts ~3px left of the thumb it is meant to sit under. */
 .speed-bar-marker {
   position: absolute;
-  /* (1.0 - 0.25) / (2.0 - 0.25) = 42.857% — aligns with the thumb at 1.0x */
-  left: calc(42.857% - 5px);
+  left: calc(0.2 * (100% - var(--thumb)) + var(--thumb) / 2 - 5px); /* -5px: half the marker */
   top: 50%;
   transform: translateY(-50%);
   width: 10px;
@@ -699,8 +703,8 @@ body.section-loop-active #control-bar .ab-only {
   background: linear-gradient(
     to right,
     var(--accent) 0%,
-    var(--accent) var(--speed-fill, 42.86%),
-    rgba(255, 255, 255, 0.22) var(--speed-fill, 42.86%),
+    var(--accent) var(--speed-fill, 21.7px),
+    rgba(255, 255, 255, 0.22) var(--speed-fill, 21.7px),
     rgba(255, 255, 255, 0.22) 100%
   );
   border-radius: 3px;
@@ -710,8 +714,8 @@ body.section-loop-active #control-bar .ab-only {
 
 #speed-bar::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 11px;
-  height: 11px;
+  width: var(--thumb);
+  height: var(--thumb);
   border-radius: 50%;
   background: #fff;
   cursor: pointer;
