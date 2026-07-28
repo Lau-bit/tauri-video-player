@@ -11,6 +11,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
+#[cfg(test)]
+mod tests;
+
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "webm", "mov", "mkv", "avi", "flv", "m4v", "wmv", "ts", "mpg", "mpeg", "3gp",
 ];
@@ -556,6 +559,61 @@ struct CropRect {
     h: f64,
 }
 
+/// A scratch path beside `target`, so a finished save can be moved into place with a
+/// same-volume rename. Keeps the destination's extension — ffmpeg picks the muxer from it.
+fn scratch_path_for(target: &Path) -> PathBuf {
+    let ext = target
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or("mp4");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let name = format!(".vp-save-{}-{stamp}.{ext}", std::process::id());
+    match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// First free `stem (n).ext` beside `target`. Used only to park a finished cut when the
+/// destination itself can't be replaced, so the encode is never thrown away.
+fn unique_sibling(target: &Path) -> PathBuf {
+    let dir = target.parent().unwrap_or_else(|| Path::new(""));
+    let stem = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("cut");
+    let ext = target.extension().and_then(|ext| ext.to_str()).unwrap_or("mp4");
+    for n in 1..1000 {
+        let candidate = dir.join(format!("{stem} ({n}).{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem} (cut).{ext}"))
+}
+
+/// True when two paths name the same file on disk. A string compare is not enough: on
+/// Windows `C:\a\Clip.mp4`, `C:/a/clip.mp4` and the 8.3 short form are all one file.
+/// Canonicalize resolves the real on-disk casing; a path that doesn't exist can't be a
+/// match, so a failed lookup is a clean `false`.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Reports whether the save target is the file currently open, so the frontend can let
+/// go of the media element before its file is replaced underneath it.
+#[tauri::command]
+fn is_same_video_file(a: String, b: String) -> bool {
+    is_same_file(Path::new(&a), Path::new(&b))
+}
+
 #[tauri::command]
 fn save_section(
     file_path: String,
@@ -568,6 +626,9 @@ fn save_section(
     let duration = end - start;
     if duration <= 0.0 {
         return Err("Invalid section: end must be after start".to_string());
+    }
+    if !Path::new(&file_path).exists() {
+        return Err(format!("Source file no longer exists: {file_path}"));
     }
     let mut cmd = Command::new("ffmpeg");
     if start > 0.01 {
@@ -612,18 +673,54 @@ fn save_section(
         }
     }
 
-    cmd.args(["-y", &output_path]);
+    // Never point ffmpeg at the destination. It truncates its output as soon as it opens
+    // it, so writing there directly destroys whatever was in that path the moment
+    // anything goes wrong — and when the destination IS the source (trim the head, keep
+    // the name) it eats the file it is still reading. ffmpeg's own in-place guard is a
+    // plain strcmp on the two path strings, so `Clip.mp4` -> `clip.mp4` sails past it and
+    // silently truncates the original mid-read, exiting 0 as if it had worked.
+    //
+    // So: encode to a scratch file beside the destination, and only once ffmpeg has
+    // exited cleanly move it into place. Until that rename the original is untouched, and
+    // nothing that existed before this call is ever deleted.
+    let final_path = PathBuf::from(&output_path);
+    let scratch = scratch_path_for(&final_path);
+
+    cmd.arg("-y").arg(&scratch);
     no_window(&mut cmd);
     let status = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        let _ = fs::remove_file(&output_path);
-        Err(format!("ffmpeg exited with code {:?}", status.code()))
+        .map_err(|error| {
+            let _ = fs::remove_file(&scratch);
+            format!("Failed to run ffmpeg: {error}")
+        })?;
+    if !status.success() {
+        let _ = fs::remove_file(&scratch);
+        return Err(format!("ffmpeg exited with code {:?}", status.code()));
+    }
+
+    // `fs::rename` is MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows: the swap is
+    // atomic, so the destination is either the old file or the complete new one.
+    if fs::rename(&scratch, &final_path).is_ok() {
+        return Ok(());
+    }
+
+    // Replace refused — the destination is typically still held open by a player. The cut
+    // is finished and valid, so park it under a free name rather than discard it.
+    let parked = unique_sibling(&final_path);
+    match fs::rename(&scratch, &parked) {
+        Ok(()) => Err(format!(
+            "Could not replace {} — it may still be open. The cut was saved as {} instead.",
+            final_path.display(),
+            parked.display()
+        )),
+        Err(error) => Err(format!(
+            "Could not write {}: {error}. The cut is at {}.",
+            final_path.display(),
+            scratch.display()
+        )),
     }
 }
 
@@ -704,6 +801,7 @@ pub fn run() {
             set_editor_path,
             transcode_file,
             save_section,
+            is_same_video_file,
             window_close,
             window_is_fullscreen,
             window_is_maximized,

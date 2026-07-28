@@ -71,6 +71,7 @@ window.videoAPI = {
 
   saveSection: (filePath, start, end, outputPath, stripAudio, crop) =>
     invoke('save_section', { filePath, start, end, outputPath, stripAudio, crop: crop ?? null }),
+  isSameVideoFile: (a, b) => invoke('is_same_video_file', { a, b }),
   saveSectionDialog: defaultPath =>
     dialog.save({
       title: 'Save A-B Section',

@@ -1021,16 +1021,34 @@ btnSaveSection.addEventListener('click', async () => {
 
   const crop = state.cropActive ? computeCrop() : null;
   const stripAudio = state.stripAudio;
+  const sourcePath = state.filePath;
+
+  // Saving over the file we're playing is a normal thing to want (drop the first few
+  // seconds, keep the name). It only works if we let go of the file first: while the
+  // <video> element holds it open, Windows refuses to replace it. Asked of the backend
+  // rather than string-compared here, because `Clip.mp4` and `clip.mp4` are one file.
+  const overwritesSource = await window.videoAPI.isSameVideoFile(sourcePath, outputPath);
+  const cutStart = state.sectionStart;
+  const resumeAt = video.currentTime;
+  const wasPlaying = !video.paused && !video.ended;
+  let saved = false;
 
   const prevName = filenameDisplay.textContent;
   saveMsg.textContent = crop ? 'Saving cropped A-B section…' : 'Saving A-B section…';
   document.body.classList.add('saving');
   btnSaveSection.disabled = true;
 
+  if (overwritesSource) {
+    video.pause();
+    video.removeAttribute('src');
+    video.load(); // drops WebView2's handle on the file about to be replaced
+  }
+
   try {
     await window.videoAPI.saveSection(
-      state.filePath, state.sectionStart, state.sectionEnd, outputPath, stripAudio, crop,
+      sourcePath, state.sectionStart, state.sectionEnd, outputPath, stripAudio, crop,
     );
+    saved = true;
     const savedName = outputPath.replace(/\\/g, '/').split('/').pop();
     filenameDisplay.textContent = 'Saved: ' + savedName;
     setTimeout(() => { filenameDisplay.textContent = prevName; }, 3000);
@@ -1038,6 +1056,22 @@ btnSaveSection.addEventListener('click', async () => {
     filenameDisplay.textContent = '⚠ Save failed: ' + (err?.message || String(err));
     setTimeout(() => { filenameDisplay.textContent = prevName; }, 4000);
   } finally {
+    if (overwritesSource) {
+      // We let go of the file, so it has to come back either way — it's a different
+      // video now if the save landed, the untouched original if it didn't. A-B markers
+      // pointed into the old timeline, so they go.
+      sectionPositions.delete(sourcePath);
+      state.sectionStart = 0;
+      state.sectionEnd = 0;
+      // Everything before the cut is gone from the file, so the playhead moves back by
+      // that much to stay on the same frame. Attached before the load so a fast
+      // loadedmetadata can't fire first.
+      const resumeTo = saved ? resumeAt - cutStart : resumeAt;
+      video.addEventListener('loadedmetadata', () => {
+        video.currentTime = Math.max(0, Math.min(resumeTo, video.duration || 0));
+      }, { once: true });
+      await loadFile(sourcePath, wasPlaying);
+    }
     document.body.classList.remove('saving');
     btnSaveSection.disabled = false;
   }
