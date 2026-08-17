@@ -5,7 +5,10 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +42,17 @@ struct AppState {
     folder_cache: Mutex<HashMap<PathBuf, FolderCacheEntry>>,
     ffmpeg: Mutex<Option<Child>>,
     temp_files: Mutex<HashSet<PathBuf>>,
+    /// A file handed over by a second launch that the page has not taken yet. Holds only
+    /// the most recent one — a burst of Explorer double-clicks means "open the last".
+    pending_file: Mutex<Option<String>>,
+    /// Set once the page has registered its `video-open-file` listener. Until then a
+    /// handover can only be parked in `pending_file`; emitting would go nowhere.
+    frontend_ready: AtomicBool,
+    /// Last maximized state broadcast to the page, so a drag-resize does not emit on
+    /// every frame.
+    last_maximized: AtomicBool,
+    /// Same, for minimized state — Resized fires repeatedly around a minimize.
+    last_minimized: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -48,6 +62,28 @@ struct TranscodeResult {
     output_path: Option<String>,
     cancelled: bool,
     error: Option<String>,
+}
+
+/// Whether the window is minimized, asked of Windows rather than of Tauri.
+///
+/// `WebviewWindow::is_minimized()` reports tao's own cached flag, and an external restore
+/// does not update it: measured with the window genuinely restored and visible
+/// (`IsIconic` false, `IsWindowVisible` true), Tauri still answered `true` indefinitely.
+/// Anything minimized by the app and restored from the taskbar or Alt-Tab therefore
+/// looked minimized forever. `IsIconic` is the state Windows itself keeps.
+#[cfg(windows)]
+fn window_is_minimized(window: &WebviewWindow) -> Option<bool> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsIconic(hwnd: isize) -> i32;
+    }
+    let hwnd = window.hwnd().ok()?;
+    Some(unsafe { IsIconic(hwnd.0 as isize) } != 0)
+}
+
+#[cfg(not(windows))]
+fn window_is_minimized(window: &WebviewWindow) -> Option<bool> {
+    window.is_minimized().ok()
 }
 
 fn is_video_path(path: &Path) -> bool {
@@ -154,9 +190,18 @@ fn read_u64_be(data: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_be_bytes(data.get(offset..offset + 8)?.try_into().ok()?))
 }
 
+/// Walks the MP4/MOV box tree collecting sample-entry fourccs.
+///
+/// Every offset step here is saturating on purpose. Box sizes are attacker-shaped data
+/// read straight off disk: a 64-bit extended size of `u64::MAX` used to make
+/// `offset + size` overflow, which is a **panic** under the debug profile's overflow
+/// checks. This runs on the main thread across a non-unwinding FFI boundary, so that
+/// panic aborted the whole process — opening one corrupt file killed the player
+/// (`STATUS_STACK_BUFFER_OVERRUN`). Saturating instead clamps the walk to `end` and the
+/// loop terminates normally with whatever it managed to parse.
 fn walk_boxes(data: &[u8], start: usize, end: usize, fourccs: &mut HashSet<String>) {
     let mut offset = start;
-    while offset + 8 <= end {
+    while offset.saturating_add(8) <= end {
         let mut size = match read_u32_be(data, offset) {
             Some(size) => size,
             None => break,
@@ -167,7 +212,7 @@ fn walk_boxes(data: &[u8], start: usize, end: usize, fourccs: &mut HashSet<Strin
         };
         let mut header_len = 8usize;
         if size == 1 {
-            if offset + 16 > end {
+            if offset.saturating_add(16) > end {
                 break;
             }
             size = match read_u64_be(data, offset + 8) {
@@ -181,12 +226,13 @@ fn walk_boxes(data: &[u8], start: usize, end: usize, fourccs: &mut HashSet<Strin
         if size < 8 {
             break;
         }
-        let box_end = (offset + size as usize).min(end);
+        let step = usize::try_from(size).unwrap_or(usize::MAX);
+        let box_end = offset.saturating_add(step).min(end);
         if matches!(box_type.as_str(), "moov" | "trak" | "mdia" | "minf" | "stbl") {
-            walk_boxes(data, offset + header_len, box_end, fourccs);
+            walk_boxes(data, offset.saturating_add(header_len), box_end, fourccs);
         } else if box_type == "stsd" {
-            let mut entry_offset = offset + header_len + 8;
-            while entry_offset + 8 <= box_end {
+            let mut entry_offset = offset.saturating_add(header_len).saturating_add(8);
+            while entry_offset.saturating_add(8) <= box_end {
                 let entry_size = match read_u32_be(data, entry_offset) {
                     Some(size) if size >= 8 => size as usize,
                     _ => break,
@@ -196,10 +242,12 @@ fn walk_boxes(data: &[u8], start: usize, end: usize, fourccs: &mut HashSet<Strin
                         fourccs.insert(String::from_utf8_lossy(bytes).to_string());
                     }
                 }
-                entry_offset += entry_size;
+                entry_offset = entry_offset.saturating_add(entry_size);
             }
         }
-        offset += size as usize;
+        // A size of 0 after saturation would spin forever; every path above guarantees
+        // size >= 8, so this always advances.
+        offset = offset.saturating_add(step);
     }
 }
 
@@ -245,12 +293,21 @@ fn mp4_codec_info(file_path: &Path) -> Option<Vec<String>> {
             moov_size = box_size;
             break;
         }
-        pos += box_size;
+        // Saturating for the same reason as walk_boxes: a corrupt 64-bit box size
+        // overflowed this and aborted the process. Saturating just ends the scan.
+        pos = pos.saturating_add(box_size);
     }
 
-    let read_size = moov_size.min(8 * 1024 * 1024) as usize;
+    // Clamp to what the file actually holds as well as to the 8 MB ceiling — a corrupt
+    // box can claim far more than it has, and read_exact on a short read fails outright.
+    let moov_offset = moov_offset?;
+    let available = file_size.saturating_sub(moov_offset);
+    let read_size = moov_size.min(8 * 1024 * 1024).min(available) as usize;
+    if read_size < 8 {
+        return None;
+    }
     let mut moov = vec![0u8; read_size];
-    file.seek(SeekFrom::Start(moov_offset?)).ok()?;
+    file.seek(SeekFrom::Start(moov_offset)).ok()?;
     file.read_exact(&mut moov).ok()?;
 
     let mut fourccs = HashSet::new();
@@ -358,9 +415,148 @@ fn get_codec_info(file_path: String) -> Option<Vec<String>> {
     mp4_codec_info(Path::new(&file_path))
 }
 
+/// One discovered subtitle file: WebVTT text ready for a blob URL, plus a label.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleTrack {
+    label: String,
+    vtt: String,
+}
+
+/// `Clip.mp4` -> `Clip.srt`, `Clip.vtt`, `Clip.en.srt`, `Clip.forced.vtt`, …
+///
+/// Chromium demuxes no embedded subtitle track this player can reach: MKV subtitle
+/// streams and MP4 `mov_text` both come back as zero `textTracks` (measured on both).
+/// A sidecar file is the only subtitle source that can actually be rendered, so it is
+/// the one we look for.
+fn find_sidecar_subtitles(video_path: &Path) -> Vec<SubtitleTrack> {
+    let Some(dir) = video_path.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = video_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Vec::new();
+    };
+    let stem_lower = stem.to_lowercase();
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let ext = path.extension()?.to_str()?.to_lowercase();
+            if ext != "srt" && ext != "vtt" {
+                return None;
+            }
+            let name = path.file_stem()?.to_str()?.to_lowercase();
+            // Either exactly the video's name, or the video's name plus a language-ish
+            // suffix (`Clip.en`, `Clip.forced`). Never a different video's subtitles.
+            let suffix = if name == stem_lower {
+                String::new()
+            } else if let Some(rest) = name.strip_prefix(&format!("{stem_lower}.")) {
+                rest.to_string()
+            } else {
+                return None;
+            };
+            Some((suffix, path))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+
+    found
+        .into_iter()
+        .filter_map(|(suffix, path)| {
+            let raw = fs::read_to_string(&path).ok().or_else(|| {
+                // Subtitle files are frequently Latin-1; salvage them rather than
+                // dropping the track entirely.
+                fs::read(&path)
+                    .ok()
+                    .map(|bytes| bytes.iter().map(|&b| b as char).collect())
+            })?;
+            let is_vtt = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("vtt"));
+            let vtt = if is_vtt { raw } else { srt_to_vtt(&raw) };
+            let label = if suffix.is_empty() {
+                "Subtitles".to_string()
+            } else {
+                suffix
+            };
+            Some(SubtitleTrack { label, vtt })
+        })
+        .collect()
+}
+
+/// SRT -> WebVTT. The two formats differ, for our purposes, in the header and in the
+/// `,` vs `.` decimal separator on cue timings.
+fn srt_to_vtt(srt: &str) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    for line in srt.lines() {
+        let trimmed = line.trim_start_matches('\u{feff}');
+        if trimmed.contains("-->") {
+            out.push_str(&trimmed.replace(',', "."));
+        } else {
+            out.push_str(trimmed);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[tauri::command]
-fn get_initial_file() -> Option<String> {
-    initial_file_arg().map(|path| path.to_string_lossy().to_string())
+fn get_subtitles(file_path: String) -> Vec<SubtitleTrack> {
+    find_sidecar_subtitles(Path::new(&file_path))
+}
+
+/// Hand a parked file to the page, if there is one and the page is listening.
+///
+/// Called from a background thread after a second launch, and again from `frontend_ready`
+/// once the page can actually receive it. Taking the value is what makes it idempotent:
+/// whichever path gets there first wins and the other finds the slot empty.
+fn deliver_pending_file(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if !state.frontend_ready.load(Ordering::SeqCst) {
+        return;
+    }
+    let pending = state
+        .pending_file
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(path) = pending {
+        let _ = app.emit("video-open-file", path);
+    }
+}
+
+/// Bring the existing window forward for a handover. Deliberately does NOT build
+/// anything: creating a webview window inside the single-instance callback deadlocks the
+/// app (see the comment on the plugin registration in `run`).
+fn surface_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// The page announcing that its event listeners are attached. Returns the file this
+/// instance should open: a handover that arrived during startup if there is one,
+/// otherwise this process's own command line.
+///
+/// This exists because the two are genuinely racy — `initialize_plugins` runs before
+/// `setup` creates the window, so a second launch can land before the page exists at all.
+#[tauri::command]
+fn frontend_ready(state: tauri::State<'_, AppState>) -> Option<String> {
+    state.frontend_ready.store(true, Ordering::SeqCst);
+    let pending = state
+        .pending_file
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    pending.or_else(|| initial_file_arg().map(|path| path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -787,15 +983,60 @@ fn window_start_drag(window: WebviewWindow) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        // Registered first, per the plugin's own guidance. The callback parks the path
+        // and hands off to a background thread rather than doing the work inline: the
+        // plugin runs this synchronously inside the window procedure while the launching
+        // process is blocked in a cross-process SendMessageW, so anything slow (or
+        // anything that pumps messages, such as building a window) deadlocks the app
+        // permanently. Explorer opening several selected files at once is exactly that
+        // burst. See memory note `tauri-single-instance-window-hang`.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            let cwd = PathBuf::from(cwd);
+            if let Some(path) = first_video_arg(argv.into_iter().skip(1), Some(&cwd)) {
+                if let Ok(mut slot) = app.state::<AppState>().pending_file.lock() {
+                    *slot = Some(path.to_string_lossy().to_string());
+                }
+            }
+            let app = app.clone();
+            thread::spawn(move || {
+                surface_main_window(&app);
+                deliver_pending_file(&app);
+            });
+        }))
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // Minimized state has no event to hang off: WebView2 does not fire
+            // `visibilitychange` for a minimize, and tao swallows the WM_SIZE that
+            // carries SIZE_MINIMIZED so `WindowEvent::Resized` never arrives either
+            // (both measured — a taskbar minimize produced no event of any kind).
+            // Without a signal, a window minimized by the app's own button and restored
+            // from the taskbar stayed paused forever. So: poll it, cheaply, and emit only
+            // on a change.
+            let handle = app.handle().clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_millis(400));
+                let Some(window) = handle.get_webview_window("main") else {
+                    continue;
+                };
+                let Some(is_minimized) = window_is_minimized(&window) else {
+                    continue;
+                };
+                let state = handle.state::<AppState>();
+                if state.last_minimized.swap(is_minimized, Ordering::SeqCst) != is_minimized {
+                    let _ = handle.emit("window-minimize-changed", is_minimized);
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             cancel_transcode,
             cleanup_temp,
+            frontend_ready,
             get_autoplay_switched,
             get_codec_info,
             get_editor_path,
             get_folder_files,
-            get_initial_file,
+            get_subtitles,
             open_editor,
             set_autoplay_switched,
             set_editor_path,
@@ -822,6 +1063,23 @@ pub fn run() {
                 for path in paths {
                     let _ = fs::remove_file(path);
                 }
+            }
+            // The titlebar button used to track maximized state only when the app itself
+            // did the maximizing. Win+Up, Aero Snap, a taskbar restore and the drag
+            // strip's own double-click all go through Windows without touching our
+            // command, leaving the button showing the wrong glyph and the wrong tooltip
+            // — and "Maximize" would then restore. Resized covers every one of those.
+            // Guarded on change so a drag-resize does not emit on every frame.
+            tauri::WindowEvent::Resized(_) => {
+                if let Ok(is_maximized) = window.is_maximized() {
+                    let state = window.state::<AppState>();
+                    if state.last_maximized.swap(is_maximized, Ordering::SeqCst) != is_maximized {
+                        let _ = window.emit("window-maximize-changed", is_maximized);
+                    }
+                }
+                // Minimize/restore is watched by the poll in `setup` instead: tao filters
+                // out the WM_SIZE that carries SIZE_MINIMIZED, so Resized never fires for
+                // it, and WebView2 fires no `visibilitychange` either (both measured).
             }
             tauri::WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                 // WebView2 loses its render surface when moved to a monitor with a

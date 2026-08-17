@@ -95,10 +95,19 @@ window.videoAPI = {
     };
   },
 
-  getInitialFile: () => invoke('get_initial_file'),
-  onOpenFile: callback => {
+  // Resolves only once the listener is actually registered, so the page can tell the
+  // backend it is ready without a gap a handover could fall into.
+  onOpenFile: callback => listen('video-open-file', event => callback(event.payload)),
+
+  // Announces that the page can receive files, and returns the one it should open:
+  // a second launch that arrived during startup, otherwise this process's own argument.
+  frontendReady: () => invoke('frontend_ready'),
+
+  getSubtitles: filePath => invoke('get_subtitles', { filePath }),
+
+  onMinimizeChange: callback => {
     let unlisten = null;
-    listen('video-open-file', event => callback(event.payload)).then(fn => {
+    listen('window-minimize-changed', event => callback(event.payload)).then(fn => {
       unlisten = fn;
     });
     return () => {

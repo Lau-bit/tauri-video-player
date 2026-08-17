@@ -10,10 +10,14 @@ Minimalist desktop video player built with Tauri 2 and vanilla HTML/CSS/JS. Dark
   - **Crop** — drag the on-video box to frame the exported clip (re-encoded; no crop = lossless stream-copy)
   - **No Audio** — strip the audio track from the exported clip (session-only toggle, resets to off on restart)
 - Auto-transcode — unsupported codecs (e.g. HEVC, AV1) trigger an automatic ffmpeg re-encode to H.264
-- Playback speed control (0.25×–2×) with a drag-reset marker
+- Playback speed control (0.25×–4×) with a drag-reset marker
+- Frame-by-frame stepping (`,` / `.`), with the frame duration measured from the stream
+- Sidecar subtitles — a `.srt` / `.vtt` beside the video (`Clip.srt`, `Clip.en.vtt`), toggled with `C`
 - Zoom-to-fill mode with mouse panning
 - Mute, volume, loop, autoplay settings
 - External editor integration (right-click the editor button to configure)
+- Single instance — opening a video while the player is running hands the file to the
+  existing window instead of starting a second copy
 - Windows file association registration script
 
 ## Prerequisites
@@ -38,6 +42,8 @@ npm run check      # syntax-check the JS files
 |-----|--------|
 | `Space` | Play / Pause |
 | `←` / `→` | Seek ±5 s |
+| `,` / `.` | Step one frame back / forward (pauses) |
+| `C` | Toggle subtitles (when a sidecar file exists) |
 | `↑` / `↓` | Volume ±10% |
 | `[` / `]` | Speed −/+ 0.05× |
 | `0` | Reset speed to 1× |
@@ -83,3 +89,26 @@ register-windows-default-app.cmd   # Run once after building to register
 - **Folder cache.** The Rust backend caches directory listings for 60 s with mtime validation so rapid folder navigation doesn't hammer the filesystem.
 - **Transcoding.** When the browser reports a codec error (MediaError code 3 or 4), the frontend calls `transcode_file`. Rust spawns ffmpeg, streams progress events via `video-transcode-progress`, and returns the temp output path when done. The temp file is cleaned up on close or when a new video loads.
 - **Settings** are stored as JSON in the OS app-data directory (`AppHandle::path().app_data_dir()`).
+
+## Playback-state notes
+
+Behaviours below were measured on this app's WebView2, and several look like bugs if you
+do not know them:
+
+- **`visibilitychange` never fires for a minimize or restore.** The page stays "visible"
+  and video plays straight through a taskbar minimize. Minimized state is watched by a
+  poll in `setup` instead.
+- **`WebviewWindow::is_minimized()` goes stale.** After an external restore it keeps
+  answering `true` indefinitely, so minimized state is read from `IsIconic` on Windows.
+- **`WindowEvent::Resized` does not fire on minimize** (tao filters `SIZE_MINIMIZED`), but
+  it does fire for maximize/restore, which is what keeps the titlebar button honest.
+- **Positions are relative to an observed time origin, not to zero.** A stream whose
+  timestamps start late cannot seek to 0 — the element clamps to where content actually
+  begins — so the transport is drawn against that origin.
+- **Duration may be `Infinity`** (e.g. a WebM muxed to a pipe). The total then reads
+  `--:--` and the seekbar is disabled rather than showing a false `0:00`.
+- **Embedded subtitle tracks are unreachable.** MKV subtitle streams and MP4 `mov_text`
+  both surface as zero `textTracks`, which is why subtitle support is sidecar-only.
+- **`Get-Process().MainWindowHandle` may return the single-instance plugin's hidden
+  `<identifier>-sic` message window**, not the real one — worth knowing when scripting
+  against the app. Match on the `Tauri Window` class instead.

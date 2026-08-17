@@ -27,6 +27,11 @@ const state = {
   stripAudio: false,        // strip audio from saved A-B cut — resets on restart (never persisted)
   cropActive: false,        // A-B crop framing overlay shown
   crop: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }, // normalized (0-1) crop rect, relative to the video frame
+  timeOrigin: 0,            // lowest currentTime seen for this media (see the time model)
+  originSeen: false,
+  transcodedFrom: null,     // guards against transcoding the same file twice in a row
+  subtitleUrls: [],         // blob URLs for the current file's sidecar tracks
+  subtitlesOn: false,
 };
 
 // A crop is (re)set to this centered 80% inset each time a new file loads.
@@ -80,6 +85,7 @@ const transcodeMsg  = document.getElementById('transcode-msg');
 const transcodeBar  = document.getElementById('transcode-bar');
 const transcodePct  = document.getElementById('transcode-pct');
 const btnCancelTranscode  = document.getElementById('btn-cancel-transcode');
+const btnSubtitles        = document.getElementById('btn-subtitles');
 const btnSectionLoop      = document.getElementById('btn-section-loop');
 const btnCrop             = document.getElementById('btn-crop');
 const btnStripAudio       = document.getElementById('btn-strip-audio');
@@ -161,25 +167,44 @@ loadAutoplaySwitchedSetting();
 // ==============================
 // Load File
 // ==============================
-async function loadFile(filePath, forcePlay = false) {
+// Windows paths for one file can differ in case and separator (`C:\a\Clip.mp4`,
+// `c:/a/clip.mp4`), and the CLI, drag-drop and the folder listing do not agree on which
+// they produce. A plain indexOf misses on any mismatch, which silently kills prev/next.
+function samePath(a, b) {
+  return typeof a === 'string' && typeof b === 'string' &&
+    a.replace(/\//g, '\\').toLowerCase() === b.replace(/\//g, '\\').toLowerCase();
+}
+
+function indexInFolder(files, filePath) {
+  const exact = files.indexOf(filePath);
+  return exact !== -1 ? exact : files.findIndex((candidate) => samePath(candidate, filePath));
+}
+
+async function loadFile(filePath, forcePlay = false, fromNavigation = false) {
   if (!filePath) return;
   const sequence = ++loadSequence;
+  // Every `await` below is a chance for a newer load to start and finish first. Without
+  // this check the slower-resolving EARLIER request wins the race and assigns video.src
+  // last, so the player ends up playing one file while state.filePath, the title and
+  // folderIndex all describe another — and A-B save, transcode and codec lookup then act
+  // on the wrong file. Measured: a slow folder listing did exactly that.
+  const superseded = () => sequence !== loadSequence;
 
   // Cancel any running transcode and clean up its temp file
   if (state.transcodeCancel) { state.transcodeCancel(); state.transcodeCancel = null; }
   await window.videoAPI.cancelTranscode();
+  if (superseded()) return;
   document.body.classList.remove('transcoding');
-  if (state.tempFile) {
-    window.videoAPI.cleanupTemp(state.tempFile);
-    state.tempFile = null;
-  }
 
   // Save section positions for the video we're leaving
   if (state.sectionLoop && state.filePath) {
     sectionPositions.set(state.filePath, { start: state.sectionStart, end: state.sectionEnd });
   }
 
+  const previousTemp = state.tempFile;
+  state.tempFile = null;
   state.filePath = filePath;
+  state.transcodedFrom = null;
 
   // Crop rect is resolution/framing-specific — start every new video fresh.
   state.crop = defaultCrop();
@@ -192,17 +217,21 @@ async function loadFile(filePath, forcePlay = false) {
     state.sectionEnd   = saved ? saved.end   : 0; // 0 = unknown until loadedmetadata
   }
 
-  // Get all video files in the same folder (natural sort, from main process)
-  state.folderFiles = await window.videoAPI.getFolderFiles(filePath);
-  state.folderIndex = state.folderFiles.indexOf(filePath);
-
   // Convert to safe file:// URL (handles Windows backslashes, spaces, Unicode)
   const fileUrl = await window.videoAPI.getFileUrl(filePath);
+  if (superseded()) return;
 
+  resetTimeModel();
+  clearSubtitles();
   updateTimelineDisplay();
   video.src = fileUrl;
   video.load();
   video.playbackRate = state.playbackRate;
+  video.defaultPlaybackRate = state.playbackRate;
+
+  // Only now is the old temp file unreferenced — deleting it while <video> still had it
+  // open just failed silently on Windows and leaked the file into %TEMP%.
+  if (previousTemp) window.videoAPI.cleanupTemp(previousTemp);
 
   // Extract just the filename for display
   const name = filePath.replace(/\\/g, '/').split('/').pop();
@@ -214,22 +243,62 @@ async function loadFile(filePath, forcePlay = false) {
   if (forcePlay || state.autoplaySwitched) {
     playVideoWhenReady(sequence);
   }
+
+  // Folder listing and subtitle lookup only feed the controls, so they run after
+  // playback is under way rather than delaying it.
+  const files = await window.videoAPI.getFolderFiles(filePath);
+  if (superseded()) return;
+  state.folderFiles = files;
+  state.folderIndex = indexInFolder(files, filePath);
+  // A navigation-driven load must NOT resync the target: the user may already be several
+  // presses further along, and resetting here would strand the queued moves. Any other
+  // way of opening a file (dialog, drop, CLI, handover) starts a fresh position.
+  if (!fromNavigation) navTargetIndex = state.folderIndex;
+
+  await loadSubtitlesFor(filePath, sequence);
 }
 
 // ==============================
 // Folder Navigation
 // ==============================
 let lastNavTime = 0;
+let navTargetIndex = -1;      // where the user has asked to be, ahead of what has loaded
+let navTimer = null;
 const NAV_INTERVAL = 100; // ms — max 10 items/second
 
+// The rate limit exists so a held key does not thrash the decoder and the filesystem.
+// It used to enforce that by DROPPING every request inside the window, which loses the
+// user's intent twice over:
+//   - five Next presses in 150 ms advanced two files, not five (measured);
+//   - auto-switch died on short clips, because `ended` arrives within 100 ms of the nav
+//     that loaded them, so the advance was swallowed and the player sat paused forever.
+// Coalescing keeps the same delivery rate but never discards a request: the target index
+// moves immediately, and the load catches up.
 function navigateFolder(delta) {
   if (!state.folderFiles.length) return;
+
+  const base = navTargetIndex >= 0 ? navTargetIndex : state.folderIndex;
+  const next = clamp(base + delta, 0, state.folderFiles.length - 1);
+  if (next === base) return;              // already at the end of the folder
+  navTargetIndex = next;
+
   const now = Date.now();
-  if (now - lastNavTime < NAV_INTERVAL) return;
-  lastNavTime = now;
-  const next = state.folderIndex + delta;
-  if (next < 0 || next >= state.folderFiles.length) return;
-  loadFile(state.folderFiles[next]);
+  const wait = NAV_INTERVAL - (now - lastNavTime);
+  if (wait <= 0) {
+    flushNavigation();
+  } else if (!navTimer) {
+    navTimer = setTimeout(flushNavigation, wait);
+  }
+}
+
+function flushNavigation() {
+  clearTimeout(navTimer);
+  navTimer = null;
+  if (navTargetIndex < 0 || navTargetIndex >= state.folderFiles.length) return;
+  const target = state.folderFiles[navTargetIndex];
+  if (!target || samePath(target, state.filePath)) return;
+  lastNavTime = Date.now();
+  loadFile(target, false, true);
 }
 
 // ==============================
@@ -256,37 +325,109 @@ function updatePlayBtn() {
 function playVideoWhenReady(sequence = loadSequence) {
   if (!video.src) return;
 
-  const play = () => {
-    if (sequence !== loadSequence) return;
-    video.play().catch(() => {});
-  };
-
   if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-    play();
+    if (sequence === loadSequence) video.play().catch(() => {});
     return;
   }
 
-  video.addEventListener('loadeddata', play, { once: true });
+  // A file that never becomes ready (unsupported codec, corrupt) used to leave this
+  // listener attached forever, so rapid switching through bad files piled them up.
+  // The AbortController tears down whichever arm resolves first.
+  //
+  // Note `emptied` is deliberately NOT a terminator: video.load() fires it immediately
+  // after this runs, which would cancel the pending play before the file ever loads.
+  const done = new AbortController();
+  video.addEventListener('loadeddata', () => {
+    done.abort();
+    if (sequence === loadSequence) video.play().catch(() => {});
+  }, { signal: done.signal });
+  video.addEventListener('error', () => done.abort(), { signal: done.signal });
 }
 
 // ==============================
 // Timeline Display
 // ==============================
-function updateTimelineDisplay() {
-  const duration = video.duration;
-  const currentTime = video.currentTime;
+// ==============================
+// Time model
+// ==============================
+// Three media shapes broke the old "currentTime / duration" arithmetic outright:
+//
+//  - Unknown duration (a WebM muxed to a pipe reports Infinity). The transport showed
+//    "0:00 / 0:00" with a dead seekbar while the video played perfectly.
+//  - Sub-second clips. formatTime floors to whole seconds, so a 0.3 s clip also read
+//    "0:00 / 0:00" — indistinguishable from no file loaded, with the bar at 100%.
+//  - A stream whose timestamps start late (PTS at ~100 s). A 6 s clip reported a
+//    duration of 1:44, opened at 97% of the bar, and `currentTime = 0` landed at 100.5 s
+//    because the element clamps to where content actually starts.
+//
+// So positions are kept relative to an observed origin rather than to zero. The origin
+// is the lowest currentTime this media has been seen at; seeking toward the start
+// reveals the true value through the element's own clamping, so it self-corrects.
+function resetTimeModel() {
+  state.timeOrigin = 0;
+  state.originSeen = false;
+}
 
-  if (!duration || !isFinite(duration)) {
+// Returns true when the origin moved, so callers can refresh a display that was drawn
+// against the old one — the total is derived from it, and it is usually learned a beat
+// after the first paint.
+function noteTimeOrigin() {
+  const t = video.currentTime;
+  if (!isFinite(t)) return false;
+  if (state.originSeen && t >= state.timeOrigin) return false;
+  // Ignore the bogus pre-roll value some containers report before duration settles
+  // (measured: currentTime === duration at loadedmetadata on a late-PTS file).
+  if (!state.originSeen && isFinite(video.duration) && t >= video.duration) return false;
+  state.timeOrigin = t;
+  state.originSeen = true;
+  return true;
+}
+
+// Seconds of content available, or null when the media has not said.
+function playableDuration() {
+  const duration = video.duration;
+  if (!duration || !isFinite(duration) || isNaN(duration)) return null;
+  const span = duration - state.timeOrigin;
+  return span > 0 ? span : duration;
+}
+
+function playablePosition() {
+  return clamp(video.currentTime - state.timeOrigin, 0, playableDuration() ?? Infinity);
+}
+
+// Maps a 0-1 fraction of the bar onto a real currentTime.
+function timeAtFraction(fraction) {
+  const span = playableDuration();
+  if (span === null) return null;
+  return state.timeOrigin + clamp(fraction, 0, 1) * span;
+}
+
+function updateTimelineDisplay() {
+  // While the pointer holds the thumb, the bar belongs to the user. `isScrubbing` was
+  // assigned for exactly this and then never read, so playback kept rewriting the thumb
+  // out from under the drag. The time readout still tracks, so the position is visible.
+  const owned = isScrubbing;
+  const span = playableDuration();
+  const position = playablePosition();
+
+  if (span === null) {
+    // Duration genuinely unknown. Keep the elapsed readout live — it is real
+    // information — and say so about the total rather than claiming 0:00.
     seekbar.value = 0;
     seekbar.style.setProperty('--seek-fill', '0%');
-    timeDisplay.textContent = '0:00 / 0:00';
+    seekbar.disabled = true;
+    timeDisplay.textContent = video.src
+      ? formatTime(position) + ' / --:--'
+      : '0:00 / 0:00';
     return;
   }
 
-  const pct = (currentTime / duration) * 100;
-  seekbar.value = Math.round((currentTime / duration) * 10000);
+  seekbar.disabled = false;
+  timeDisplay.textContent = formatTime(position, span) + ' / ' + formatTime(span, span);
+  if (owned) return;
+  const pct = clamp((position / span) * 100, 0, 100);
+  seekbar.value = Math.round((pct / 100) * 10000);
   seekbar.style.setProperty('--seek-fill', pct.toFixed(2) + '%');
-  timeDisplay.textContent = formatTime(currentTime) + ' / ' + formatTime(duration);
 }
 
 // ==============================
@@ -607,8 +748,15 @@ function toggleZoomFill() {
 // ==============================
 // Time Formatting
 // ==============================
-function formatTime(secs) {
+// `scale` is the length of the material being timed. Under ten seconds the readout gains
+// a decimal, because whole-second resolution renders every short clip as "0:00 / 0:00" —
+// which is exactly what the empty player shows.
+function formatTime(secs, scale = Infinity) {
   if (!isFinite(secs) || isNaN(secs)) return '0:00';
+  if (secs < 0) secs = 0;
+  if (isFinite(scale) && scale > 0 && scale < 10) {
+    return `0:${secs.toFixed(1).padStart(4, '0')}`;
+  }
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   const s = Math.floor(secs % 60);
@@ -621,6 +769,15 @@ function formatTime(secs) {
 // ==============================
 // Mute Button
 // ==============================
+// The slider is a view of video.volume, so it is refreshed from the element on every
+// volumechange. It used to be written only by the handlers that also changed the volume,
+// so any other route left the thumb showing a volume the player was not at.
+function syncVolumeControls() {
+  const shown = video.muted ? 0 : Math.round(video.volume * 100);
+  if (Number(volumeBar.value) !== shown) volumeBar.value = shown;
+  updateMuteBtn();
+}
+
 function updateMuteBtn() {
   if (video.muted || video.volume === 0) {
     btnMute.textContent = '\uD83D\uDD07'; // 🔇
@@ -679,11 +836,224 @@ function leaveHiddenWindowState() {
 }
 
 // ==============================
+// Frame Stepping
+// ==============================
+// HTML5 media exposes no frame rate, so it is measured from the presentation times
+// `requestVideoFrameCallback` reports. The most recent gap is used rather than an
+// average, which keeps the step honest on variable-frame-rate material where there is no
+// single correct answer. 1/30 s until a measurement exists.
+const DEFAULT_FRAME_DURATION = 1 / 30;
+let frameDuration = DEFAULT_FRAME_DURATION;
+let lastFrameMediaTime = null;
+let frameCallbackHandle = null;
+
+function measureFrames() {
+  if (typeof video.requestVideoFrameCallback !== 'function') return;
+  frameCallbackHandle = video.requestVideoFrameCallback((_now, meta) => {
+    const t = meta && typeof meta.mediaTime === 'number' ? meta.mediaTime : video.currentTime;
+    if (lastFrameMediaTime !== null) {
+      const delta = t - lastFrameMediaTime;
+      // Ignore seeks and pathological gaps; real frames sit between 240fps and 1fps.
+      if (delta > 1 / 240 && delta < 1) frameDuration = delta;
+    }
+    lastFrameMediaTime = t;
+    measureFrames();
+  });
+}
+
+function resetFrameMeasurement() {
+  if (frameCallbackHandle !== null && typeof video.cancelVideoFrameCallback === 'function') {
+    video.cancelVideoFrameCallback(frameCallbackHandle);
+  }
+  frameCallbackHandle = null;
+  lastFrameMediaTime = null;
+  frameDuration = DEFAULT_FRAME_DURATION;
+  measureFrames();
+}
+
+function stepFrame(direction) {
+  if (!video.src) return;
+  if (!video.paused) video.pause();
+  const span = playableDuration();
+  const max = span === null ? Infinity : state.timeOrigin + span;
+  const next = video.currentTime + direction * frameDuration;
+  video.currentTime = clamp(next, state.timeOrigin, max);
+}
+
+// ==============================
+// Stall Watchdog
+// ==============================
+// Two things this recovers from, both of which leave the element claiming to play while
+// nothing moves: a decoder that wedges (seeking around variable-frame-rate or
+// broken-timestamp material is the usual trigger), and the machine waking from sleep,
+// where the audio device is re-enumerated underneath a running pipeline.
+//
+// Recovery is a nudge to the same position, which forces the pipeline to re-resolve and
+// re-aligns audio against video. It is deliberately conservative: it only ever runs when
+// the element says it is playing and has data, and it gives up after a few attempts
+// rather than fighting a genuinely broken file forever.
+const WATCHDOG_INTERVAL = 500;
+const STALL_TICKS = 6;          // ~3 s of no progress while "playing"
+const SLEEP_GAP = 5000;         // wall-clock jump that means the machine was suspended
+const MAX_RECOVERIES = 3;
+
+let watchdogLastTime = 0;
+let watchdogStuckTicks = 0;
+let watchdogRecoveries = 0;
+let watchdogLastWallClock = Date.now();
+
+function resetWatchdog() {
+  watchdogLastTime = video.currentTime;
+  watchdogStuckTicks = 0;
+  watchdogRecoveries = 0;
+}
+
+function recoverPlayback(reason) {
+  const at = video.currentTime;
+  // Re-seeking to the current position re-primes the decode and audio pipelines.
+  try { video.currentTime = at; } catch { /* element not ready; the next tick retries */ }
+  if (!video.paused) video.play().catch(() => {});
+  console.warn(`[video-player] playback recovery (${reason}) at ${at.toFixed(2)}s`);
+}
+
+// The decision is a pure function of the sample so it can be exercised directly: a real
+// decoder cannot be wedged on demand, and a recovery rule that has never been run is a
+// rule nobody has checked. Returns the reason to recover, or null.
+function watchdogStep(now, sample) {
+  const wallGap = now - watchdogLastWallClock;
+  watchdogLastWallClock = now;
+
+  // A wall-clock jump far beyond the tick interval means the process was suspended.
+  if (wallGap > SLEEP_GAP && sample.hasSource && !sample.paused && !sample.ended) {
+    watchdogStuckTicks = 0;
+    watchdogRecoveries = 0;
+    watchdogLastTime = sample.currentTime;
+    return 'resumed after suspend';
+  }
+
+  if (!sample.hasSource || sample.paused || sample.ended || sample.seeking ||
+      sample.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    watchdogStuckTicks = 0;
+    watchdogLastTime = sample.currentTime;
+    return null;
+  }
+
+  if (sample.currentTime > watchdogLastTime + 0.001) {
+    watchdogLastTime = sample.currentTime;
+    watchdogStuckTicks = 0;
+    watchdogRecoveries = 0;
+    return null;
+  }
+
+  watchdogStuckTicks += 1;
+  if (watchdogStuckTicks >= STALL_TICKS && watchdogRecoveries < MAX_RECOVERIES) {
+    watchdogStuckTicks = 0;
+    watchdogRecoveries += 1;
+    return `stalled for ${(STALL_TICKS * WATCHDOG_INTERVAL) / 1000}s`;
+  }
+  return null;
+}
+
+function sampleVideo() {
+  return {
+    hasSource: !!video.src,
+    paused: video.paused,
+    ended: video.ended,
+    seeking: video.seeking,
+    readyState: video.readyState,
+    currentTime: video.currentTime,
+  };
+}
+
+setInterval(() => {
+  const reason = watchdogStep(Date.now(), sampleVideo());
+  if (reason) recoverPlayback(reason);
+}, WATCHDOG_INTERVAL);
+
+// ==============================
+// Subtitles (sidecar files)
+// ==============================
+// Neither MKV subtitle streams nor MP4 mov_text reach the page — Chromium reports zero
+// textTracks for both (measured). A sidecar .srt/.vtt beside the video is the only
+// subtitle source that can actually render, and the backend converts SRT to WebVTT.
+function clearSubtitles() {
+  video.querySelectorAll('track').forEach((track) => track.remove());
+  state.subtitleUrls.forEach((url) => URL.revokeObjectURL(url));
+  state.subtitleUrls = [];
+  state.subtitlesOn = false;
+  updateSubtitleBtn();
+}
+
+function updateSubtitleBtn() {
+  const available = state.subtitleUrls.length > 0;
+  btnSubtitles.classList.toggle('has-subtitles', available);
+  btnSubtitles.classList.toggle('active', state.subtitlesOn);
+  btnSubtitles.title = available
+    ? (state.subtitlesOn ? 'Hide subtitles (C)' : 'Show subtitles (C)')
+    : 'No subtitle file found beside this video';
+}
+
+async function loadSubtitlesFor(filePath, sequence) {
+  let tracks = [];
+  try {
+    tracks = await window.videoAPI.getSubtitles(filePath);
+  } catch {
+    tracks = [];
+  }
+  // A newer file started loading while we were reading these — they belong to the old
+  // one, and attaching them would caption the wrong video.
+  if (sequence !== loadSequence || !Array.isArray(tracks) || !tracks.length) return;
+
+  tracks.forEach((track, index) => {
+    const url = URL.createObjectURL(new Blob([track.vtt], { type: 'text/vtt' }));
+    state.subtitleUrls.push(url);
+    const el = document.createElement('track');
+    el.kind = 'subtitles';
+    el.label = track.label || `Track ${index + 1}`;
+    el.src = url;
+    el.default = index === 0;
+    video.appendChild(el);
+  });
+
+  // Attached but not shown: subtitles appearing unasked on every file that happens to
+  // have a sidecar is worse than a button that lights up.
+  requestAnimationFrame(() => {
+    for (const textTrack of video.textTracks) textTrack.mode = 'disabled';
+    updateSubtitleBtn();
+  });
+}
+
+function toggleSubtitles() {
+  if (!state.subtitleUrls.length) return;
+  state.subtitlesOn = !state.subtitlesOn;
+  let first = true;
+  for (const textTrack of video.textTracks) {
+    textTrack.mode = state.subtitlesOn && first ? 'showing' : 'disabled';
+    if (state.subtitlesOn && first) first = false;
+  }
+  updateSubtitleBtn();
+}
+
+// ==============================
 // Video Event Listeners
 // ==============================
-video.addEventListener('play', updatePlayBtn);
+video.addEventListener('play', () => {
+  updatePlayBtn();
+  // Playing again by any route means this is no longer "paused because the window went
+  // away" — leaving the flag set made a later restore resume a video the user had
+  // deliberately paused.
+  state.pausedForHiddenWindow = false;
+  resetWatchdog();
+});
 video.addEventListener('pause', updatePlayBtn);
 video.addEventListener('emptied', updateTimelineDisplay);
+video.addEventListener('seeked', resetWatchdog);
+video.addEventListener('loadeddata', () => {
+  noteTimeOrigin();
+  updateTimelineDisplay();   // the total is origin-relative, and the origin lands here
+  resetWatchdog();
+  resetFrameMeasurement();
+});
 video.addEventListener('loadedmetadata', () => {
   updateTimelineDisplay();
   if (state.sectionLoop) {
@@ -693,7 +1063,7 @@ video.addEventListener('loadedmetadata', () => {
   updateCropOverlay(); // video dimensions now known — realign the crop content rect
 });
 video.addEventListener('durationchange', updateTimelineDisplay);
-video.addEventListener('timeupdate', updateTimelineDisplay);
+video.addEventListener('timeupdate', () => { noteTimeOrigin(); updateTimelineDisplay(); });
 video.addEventListener('timeupdate', () => {
   if (!state.sectionLoop || !isFinite(video.duration)) return;
   if (video.currentTime >= state.sectionEnd) {
@@ -749,8 +1119,11 @@ video.addEventListener('error', async () => {
 
   filenameDisplay.textContent = '\u26A0 ' + msg;
 
-  // Auto-transcode via ffmpeg for codec/format errors
-  if (err.code === 3 || err.code === 4) {
+  // Auto-transcode via ffmpeg for codec/format errors, but only once per file: if the
+  // transcoded output also fails to decode, the error handler fires again and would
+  // re-transcode the same source forever.
+  if ((err.code === 3 || err.code === 4) && state.transcodedFrom !== state.filePath) {
+    state.transcodedFrom = state.filePath;
     startTranscode();
   }
 });
@@ -799,7 +1172,7 @@ btnCancelTranscode.addEventListener('click', async () => {
   document.body.classList.remove('transcoding');
 });
 
-video.addEventListener('volumechange', updateMuteBtn);
+video.addEventListener('volumechange', syncVolumeControls);
 video.addEventListener('ratechange', () => {
   if (video.playbackRate !== state.playbackRate) {
     setPlaybackRate(video.playbackRate);
@@ -824,15 +1197,19 @@ let isScrubbing = false;
 seekbar.addEventListener('mousedown', () => { isScrubbing = true; });
 
 seekbar.addEventListener('input', () => {
-  if (!video.duration || !isFinite(video.duration)) return;
-  let t = (seekbar.value / 10000) * video.duration;
+  let t = timeAtFraction(seekbar.value / 10000);
+  if (t === null) return;
   if (state.sectionLoop) {
     t = Math.max(state.sectionStart, Math.min(state.sectionEnd, t));
   }
   video.currentTime = t;
 });
 
-document.addEventListener('mouseup', () => { isScrubbing = false; });
+document.addEventListener('mouseup', () => {
+  if (!isScrubbing) return;
+  isScrubbing = false;
+  updateTimelineDisplay();   // resync to wherever the seek actually landed
+});
 
 // ==============================
 // Volume
@@ -1078,6 +1455,7 @@ btnSaveSection.addEventListener('click', async () => {
 });
 
 btnPlay.addEventListener('click', togglePlayPause);
+btnSubtitles.addEventListener('click', toggleSubtitles);
 btnLoop.addEventListener('click', toggleLoop);
 btnSectionLoop.addEventListener('click', toggleSectionLoop);
 btnCrop.addEventListener('click', toggleCrop);
@@ -1154,19 +1532,42 @@ document.addEventListener('keydown', async (e) => {
       break;
     }
 
+    // Seek bounds are the time origin, not 0: on a stream whose timestamps start late,
+    // clamping at 0 asks for a position the element cannot reach and it silently stays
+    // put. Right-arrow no longer needs a finite duration either — seeking forward in a
+    // stream of unknown length is perfectly meaningful.
     case e.key === 'ArrowLeft' && focused !== volumeBar && focused !== speedBar: {
       e.preventDefault();
-      const leftMin = state.sectionLoop ? state.sectionStart : 0;
+      const leftMin = state.sectionLoop ? state.sectionStart : state.timeOrigin;
       video.currentTime = Math.max(leftMin, video.currentTime - 5);
       break;
     }
 
     case e.key === 'ArrowRight' && focused !== volumeBar && focused !== speedBar: {
       e.preventDefault();
-      if (isFinite(video.duration)) {
-        const rightMax = state.sectionLoop ? state.sectionEnd : video.duration;
-        video.currentTime = Math.min(rightMax, video.currentTime + 5);
-      }
+      const span = playableDuration();
+      const rightMax = state.sectionLoop
+        ? state.sectionEnd
+        : (span === null ? Infinity : state.timeOrigin + span);
+      video.currentTime = Math.min(rightMax, video.currentTime + 5);
+      break;
+    }
+
+    case (e.key === ',' || e.key === '<') && !e.ctrlKey && !e.metaKey: {
+      e.preventDefault();
+      stepFrame(-1);
+      break;
+    }
+
+    case (e.key === '.' || e.key === '>') && !e.ctrlKey && !e.metaKey: {
+      e.preventDefault();
+      stepFrame(1);
+      break;
+    }
+
+    case (e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey: {
+      e.preventDefault();
+      toggleSubtitles();
       break;
     }
 
@@ -1317,6 +1718,18 @@ document.addEventListener('drop', (e) => {
   }
 });
 
+// WebView2 does not fire `visibilitychange` for a minimize or restore — measured: the
+// page stayed "visible" and playback ran straight through a taskbar minimize. So the
+// pause-while-hidden path only ever ran for the app's own minimize button, and a window
+// minimized by that button but restored from the taskbar never resumed at all. Rust
+// watches the real window state and tells us. The listener below stays as a second
+// source (it does fire when the whole page is backgrounded).
+window.videoAPI.onMinimizeChange((minimized) => {
+  if (state.closing) return;
+  if (minimized) enterHiddenWindowState();
+  else leaveHiddenWindowState();
+});
+
 document.addEventListener('visibilitychange', () => {
   if (state.closing) return;
 
@@ -1355,15 +1768,28 @@ window.videoAPI.onTauriDragDrop((payload) => {
 });
 
 // ==============================
-// CLI / File Association
+// CLI / File Association / Second-launch handover
 // ==============================
-// Main process sends this after did-finish-load if a file was passed on CLI
-window.videoAPI.onOpenFile((filePath) => {
-  loadFile(filePath, true);
-});
+// Opening a video while the player is already running used to start a whole second copy
+// of the app: there was no single-instance plugin, and this listener's `video-open-file`
+// event had no emitter anywhere in the backend. With the app registered as the Windows
+// default player, every double-clicked file spawned another window and another decoder.
+//
+// Now the second launch hands its path to this instance and exits. The order matters:
+// register the listener, and only then tell the backend we are ready, so a handover
+// arriving mid-startup is parked rather than emitted into nothing. `frontendReady`
+// returns whatever was parked, or this process's own command-line file.
+(async () => {
+  await window.videoAPI.onOpenFile((filePath) => {
+    if (filePath) loadFile(filePath, true);
+  });
 
-window.videoAPI.getInitialFile().then((filePath) => {
-  if (filePath) loadFile(filePath, true);
-});
+  const initial = await window.videoAPI.frontendReady().catch(() => null);
+  if (initial) loadFile(initial, true);
+})();
 
 setPlaybackRate(1);
+syncVolumeControls();
+resetTimeModel();
+updateSubtitleBtn();
+resetFrameMeasurement();

@@ -353,6 +353,11 @@ body.has-video #empty-state {
   background: var(--bg);
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   padding: 8px 12px 10px;
+  /* The control groups do not shrink, so at the window's own minimum width (320px) the
+     bar was 745px wide inside a 302px box and pushed the whole document sideways —
+     measured body.scrollWidth 757 against an innerWidth of 326. Clipping here keeps the
+     overflow out of the document; the media queries below decide what actually goes. */
+  overflow: hidden;
 }
 
 body.no-ui #controls,
@@ -567,6 +572,9 @@ body.zoom-fill #crop-overlay {
   justify-content: center;
   overflow: hidden;
   padding: 0 8px;
+  /* Without this the filename's intrinsic width sets a floor that no amount of
+     `overflow: hidden` can collapse, and the flex line overruns the bar. */
+  min-width: 0;
 }
 
 .ctrl-right {
@@ -792,4 +800,63 @@ body.zoom-fill.panning #video {
 
 :-webkit-full-screen #player-container {
   top: 0;
+}
+
+/* ==============================
+   Subtitles
+============================== */
+/* Dim until a sidecar file is actually found, so the button says whether subtitles
+   exist for this video before it is clicked. */
+#btn-subtitles {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+#btn-subtitles.has-subtitles {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+video::cue {
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 1em;
+  line-height: 1.35;
+}
+
+/* ==============================
+   Narrow Window
+============================== */
+/* The window's own minimum is 320x240, and at that size the control bar is far wider
+   than the space it has. Rather than clipping arbitrarily — which silently ate the
+   right-hand end, including Open and Fullscreen — drop controls by priority, so what
+   survives at the smallest size is the transport, the clock, mute, open and fullscreen. */
+/* Selectors are prefixed with #control-bar throughout: `#control-bar button` sets
+   `display: flex` at specificity (1,0,1), so a bare `#btn-editor { display: none }` at
+   (1,0,0) loses the cascade and hides nothing at all. */
+@media (max-width: 900px) {
+  #control-bar .speed-bar-wrap { display: none; }
+}
+
+@media (max-width: 780px) {
+  #control-bar #btn-editor,
+  #control-bar #btn-autoplay-switched { display: none; }
+}
+
+@media (max-width: 660px) {
+  #control-bar #btn-auto-switch,
+  #control-bar #btn-loop,
+  #control-bar #btn-speed-down,
+  #control-bar #btn-speed-up { display: none; }
+  #control-bar #volume-bar { width: 60px; }
+}
+
+@media (max-width: 540px) {
+  #control-bar #btn-section-loop,
+  #control-bar #btn-subtitles,
+  #control-bar #btn-speed-reset { display: none; }
+  /* A-B editing controls have no room to be usable this small. */
+  body.section-loop-active #control-bar .ab-only { display: none; }
+  #control-bar .ctrl-center { display: none; }
+  #control-bar #volume-bar { display: none; }
 }
